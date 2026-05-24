@@ -10,8 +10,9 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN")   # from BotFather
-CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID")     # your personal chat ID
+BOT_TOKEN = "8765588779:AAGoP0mLTY_IHEvTcgqtv4UgRkGMy3H2Tgk"
+CHAT_ID   = "8794039692"
+
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")   # optional security key
 
 # ── TELEGRAM SENDER ───────────────────────────────────────────────────────────
