@@ -39,9 +39,9 @@ def format_message(data: dict) -> str:
     ldn_h   = data.get("ldnHigh", "")
     ldn_l   = data.get("ldnLow", "")
     poc     = data.get("poc", "")
-from datetime import timezone, timedelta
-hst = timezone(timedelta(hours=-10))
-now_est = datetime.now(hst)
+    from datetime import timezone, timedelta
+    hst = timezone(timedelta(hours=-10))
+    now_est = datetime.now(hst)
 
 
     # Signal type formatting
@@ -77,8 +77,8 @@ now_est = datetime.now(hst)
     if poc:      lines.append(f"🟠 POC:      <code>${poc}</code>")
 
     lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<i>{action}</i>")
-lines.append(f"🕐 {now_est.strftime('%H:%M HST')}")
+    lines.append(f"<i>{action}</i>"
+    lines.append(f"🕐 {now_est.strftime('%H:%M HST')}")
 
 
     return "\n".join(lines)
