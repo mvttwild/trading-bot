@@ -304,7 +304,8 @@ def telegram_incoming():
     data = request.get_json(silent=True) or {}
     text = data.get("message", {}).get("text", "")
     if text:
-        handle_command(text)
+        t = threading.Thread(target=handle_command, args=(text,))
+        t.start()
     return jsonify({"ok": True}), 200
 
 # ── TRADINGVIEW WEBHOOK ───────────────────────────────────────────────────────
