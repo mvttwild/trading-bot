@@ -39,7 +39,10 @@ def format_message(data: dict) -> str:
     ldn_h   = data.get("ldnHigh", "")
     ldn_l   = data.get("ldnLow", "")
     poc     = data.get("poc", "")
-    now_est = datetime.utcnow()  # server time; adjust as needed
+from datetime import timezone, timedelta
+hst = timezone(timedelta(hours=-10))
+now_est = datetime.now(hst)
+
 
     # Signal type formatting
     if "SWEEP HIGH" in signal.upper():
@@ -75,7 +78,8 @@ def format_message(data: dict) -> str:
 
     lines.append(f"━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"<i>{action}</i>")
-    lines.append(f"🕐 {now_est.strftime('%H:%M UTC')}")
+lines.append(f"🕐 {now_est.strftime('%H:%M HST')}")
+
 
     return "\n".join(lines)
 
