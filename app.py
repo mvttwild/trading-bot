@@ -6,13 +6,13 @@
 
 import os, json, requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
 BOT_TOKEN = "8765588779:AAGoP0mLTY_IHEvTcgqtv4UgRkGMy3H2Tgk"
 CHAT_ID   = "8794039692"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")   # optional security key
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 # ── TELEGRAM SENDER ───────────────────────────────────────────────────────────
 def send_telegram(message: str):
@@ -39,12 +39,10 @@ def format_message(data: dict) -> str:
     ldn_h   = data.get("ldnHigh", "")
     ldn_l   = data.get("ldnLow", "")
     poc     = data.get("poc", "")
-    from datetime import timezone, timedelta
+
     hst = timezone(timedelta(hours=-10))
-    now_est = datetime.now(hst)
+    now_hst = datetime.now(hst)
 
-
-    # Signal type formatting
     if "SWEEP HIGH" in signal.upper():
         emoji = "⚡🔴"
         side_str = "SHORT ↓"
@@ -77,29 +75,25 @@ def format_message(data: dict) -> str:
     if poc:      lines.append(f"🟠 POC:      <code>${poc}</code>")
 
     lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<i>{action}</i>"
-    lines.append(f"🕐 {now_est.strftime('%H:%M HST')}")
-
+    lines.append(f"<i>{action}</i>")
+    lines.append(f"🕐 {now_hst.strftime('%H:%M HST')}")
 
     return "\n".join(lines)
 
 # ── WEBHOOK ENDPOINT ──────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Optional: verify secret key in URL ?secret=YOUR_KEY
     if WEBHOOK_SECRET:
         incoming = request.args.get("secret", "")
         if incoming != WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
 
-    # Parse payload — TradingView sends JSON
     raw  = request.get_data(as_text=True)
     print(f"Incoming payload: {raw[:300]}")
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Plain text fallback — just forward it as-is
         data = { "signal": raw.strip() }
 
     msg = format_message(data)
@@ -113,7 +107,6 @@ def webhook():
 # ── TEST ENDPOINT ─────────────────────────────────────────────────────────────
 @app.route("/test", methods=["GET"])
 def test():
-    """Hit this URL in browser to send a test alert to your Telegram."""
     test_payload = {
         "signal":  "SWEEP HIGH",
         "ticker":  "SPY",
