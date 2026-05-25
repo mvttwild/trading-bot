@@ -127,18 +127,83 @@ def format_events(events):
     return "\n".join(lines)
 
 # ── MORNING BRIEF ─────────────────────────────────────────────────────────────
+def fetch_options_data(symbol):
+    try:
+        today_ts = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}?date={today_ts}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        d = r.json()
+        result = d["optionChain"]["result"][0]
+        opts   = result["options"][0]
+        calls  = opts.get("calls", [])
+        puts   = opts.get("puts",  [])
+        total_put_oi  = sum(p.get("openInterest", 0) for p in puts)
+        total_call_oi = sum(c.get("openInterest", 0) for c in calls)
+        pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else None
+        all_strikes = sorted(set([o["strike"] for o in calls + puts]))
+        min_pain = float("inf")
+        max_pain_strike = None
+        for S in all_strikes:
+            call_pain = sum(max(0, S - c["strike"]) * c.get("openInterest", 0) for c in calls)
+            put_pain  = sum(max(0, p["strike"] - S) * p.get("openInterest", 0) for p in puts)
+            total = call_pain + put_pain
+            if total < min_pain:
+                min_pain = total
+                max_pain_strike = S
+        underlying = result.get("quote", {}).get("regularMarketPrice")
+        atm_iv = None
+        if underlying and calls:
+            atm = min(calls, key=lambda c: abs(c["strike"] - underlying))
+            atm_iv = round(atm.get("impliedVolatility", 0) * 100, 1)
+        return {"pcr": pcr, "max_pain": max_pain_strike, "atm_iv": atm_iv}
+    except Exception as e:
+        print(f"Options fetch error for {symbol}: {e}")
+        return {"pcr": None, "max_pain": None, "atm_iv": None}
+
+def pcr_label(pcr):
+    if pcr is None: return "N/A"
+    if pcr > 1.5:  return f"{pcr} VERY BEARISH"
+    if pcr > 1.1:  return f"{pcr} BEARISH LEAN"
+    if pcr > 0.85: return f"{pcr} NEUTRAL"
+    if pcr > 0.6:  return f"{pcr} BULLISH LEAN"
+    return             f"{pcr} VERY BULLISH"
+
+def get_ai_analysis(data_summary):
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 300,
+                "messages": [{
+                    "role": "user",
+                    "content": f"""You are Jarvis, a sharp 0DTE options trading analyst for Matt Nakamoto who trades SPY, QQQ, TSLA, NVDA, AMD, META, IWM, DIA and GLD using an ICT London failed break strategy.
+
+Based on this pre-market data give a 3-4 sentence bias analysis. Be direct and actionable.
+State overall directional bias, key risk to watch, and whether conditions favor trading or standing aside today.
+No fluff, no disclaimers. Write like a sharp trading desk analyst texting a colleague.
+
+DATA:
+{data_summary}"""
+                }]
+            },
+            timeout=20
+        )
+        result = r.json()
+        return result["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        return "AI analysis unavailable — check data manually."
+
 def send_morning_brief():
     now_hst = datetime.now(HST)
     date_str = now_hst.strftime("%A %b %d")
-
-    # Macro
     dxy = fetch_quote("DX-Y.NYB")
     tnx = fetch_quote("^TNX")
     vix = fetch_quote("^VIX")
     tlt = fetch_quote("TLT")
     xlf = fetch_quote("XLF")
-
-    # Equities watchlist
     spy  = fetch_quote("SPY")
     qqq  = fetch_quote("QQQ")
     tsla = fetch_quote("TSLA")
@@ -148,65 +213,72 @@ def send_morning_brief():
     iwm  = fetch_quote("IWM")
     dia  = fetch_quote("DIA")
     gld  = fetch_quote("GLD")
-
-    events = get_todays_events()
+    spy_opts = fetch_options_data("SPY")
+    qqq_opts = fetch_options_data("QQQ")
+    events     = get_todays_events()
     events_str = format_events(events)
-
-    # Conditions
-    warnings = []
-    if vix and vix["price"] > 25:
-        warnings.append("⚠️ VIX elevated — reduce size")
-    if vix and vix["price"] > 20:
-        warnings.append("⚠️ VIX above 20 — be selective")
-    if dxy and dxy["pct"] > 0.3:
-        warnings.append("🔴 DXY pumping — bearish equities")
-    if dxy and dxy["pct"] < -0.3:
-        warnings.append("✅ DXY weak — bullish equities")
-    if tnx and tnx["pct"] > 0.5:
-        warnings.append("⚠️ Yields spiking — watch SPY")
-    if gld and gld["pct"] > 0.5:
-        warnings.append("⚠️ Gold up — risk-off tone")
-    if gld and gld["pct"] < -0.3:
-        warnings.append("✅ Gold down — risk-on tone")
-    if any(e[2] == "🔴" for e in events):
-        warnings.append("🔴 High impact news today — be careful")
-    if not warnings:
-        warnings.append("✅ Conditions look clean — go get it")
-
-    conditions = "\n".join(warnings)
-
-    msg = f"""🌅 <b>GOOD MORNING MATT</b>
-━━━━━━━━━━━━━━━━━━━━
-📅 {date_str} | Jarvis Pre-Market Brief
-
-📊 <b>MACRO</b>
-DXY:  {fmt_macro(dxy)}
-10Y:  {fmt_macro(tnx, 3)}
-VIX:  {fmt_macro(vix)}
-TLT:  {fmt_quote(tlt)}
-XLF:  {fmt_quote(xlf)}
-
-📈 <b>INDICES</b>
-SPY:  {fmt_quote(spy)}
-QQQ:  {fmt_quote(qqq)}
-IWM:  {fmt_quote(iwm)}
-DIA:  {fmt_quote(dia)}
-
-⚡ <b>WATCHLIST</b>
-TSLA: {fmt_quote(tsla)}
-NVDA: {fmt_quote(nvda)}
-AMD:  {fmt_quote(amd)}
-META: {fmt_quote(meta)}
-GLD:  {fmt_quote(gld)}
-
-🗓 <b>ECONOMIC EVENTS (EST)</b>
-{events_str}
-
-🎯 <b>CONDITIONS</b>
-{conditions}
-━━━━━━━━━━━━━━━━━━━━
-🕐 {now_hst.strftime('%H:%M HST')} — King better be walked 🐕"""
-
+    flags = []
+    if vix and vix["price"] > 25:    flags.append("VIX ELEVATED - reduce size")
+    elif vix and vix["price"] > 20:  flags.append("VIX above 20 - be selective")
+    else:                            flags.append("VIX normal range")
+    if dxy and dxy["pct"] > 0.3:    flags.append("DXY pumping - bearish equities")
+    elif dxy and dxy["pct"] < -0.3: flags.append("DXY weak - bullish equities")
+    else:                            flags.append("DXY flat - no signal")
+    if tnx and tnx["pct"] > 0.5:    flags.append("Yields spiking - caution on longs")
+    elif tnx and tnx["pct"] < -0.3: flags.append("Yields falling - bullish tailwind")
+    if gld and gld["pct"] > 0.5:    flags.append("Gold up - risk-off tone")
+    elif gld and gld["pct"] < -0.3: flags.append("Gold down - risk-on tone")
+    if any(e[2] == "🔴" for e in events): flags.append("HIGH IMPACT NEWS TODAY")
+    conditions = "\n".join(flags)
+    def p(d, dec=2): return f"{d['price']:.{dec}f} ({d['pct']:+.2f}%)" if d else "N/A"
+    data_summary = f"""DXY: {p(dxy)} | 10Y: {p(tnx,3)} | VIX: {p(vix)} | TLT: {p(tlt)} | XLF: {p(xlf)}
+SPY: {p(spy)} | QQQ: {p(qqq)} | IWM: {p(iwm)} | DIA: {p(dia)}
+TSLA: {p(tsla)} | NVDA: {p(nvda)} | AMD: {p(amd)} | META: {p(meta)} | GLD: {p(gld)}
+SPY PCR: {spy_opts['pcr']} | SPY Max Pain: {spy_opts['max_pain']} | SPY ATM IV: {spy_opts['atm_iv']}%
+QQQ PCR: {qqq_opts['pcr']} | QQQ Max Pain: {qqq_opts['max_pain']}
+Events: {events_str} | Flags: {" | ".join(flags)}"""
+    ai_bias = get_ai_analysis(data_summary)
+    spy_pcr_str = pcr_label(spy_opts["pcr"])
+    spy_mp_str  = f"${spy_opts['max_pain']}" if spy_opts["max_pain"] else "N/A"
+    spy_iv_str  = f"{spy_opts['atm_iv']}%" if spy_opts["atm_iv"] else "N/A"
+    qqq_pcr_str = pcr_label(qqq_opts["pcr"])
+    qqq_mp_str  = f"${qqq_opts['max_pain']}" if qqq_opts["max_pain"] else "N/A"
+    msg = (
+        f"\U0001f305 <b>GOOD MORNING MATT</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4c5 {date_str} | Jarvis Pre-Market Brief\n\n"
+        f"\U0001f4ca <b>MACRO</b>\n"
+        f"DXY:  {fmt_macro(dxy)}\n"
+        f"10Y:  {fmt_macro(tnx, 3)}\n"
+        f"VIX:  {fmt_macro(vix)}\n"
+        f"TLT:  {fmt_quote(tlt)}\n"
+        f"XLF:  {fmt_quote(xlf)}\n\n"
+        f"\U0001f4c8 <b>INDICES</b>\n"
+        f"SPY:  {fmt_quote(spy)}\n"
+        f"QQQ:  {fmt_quote(qqq)}\n"
+        f"IWM:  {fmt_quote(iwm)}\n"
+        f"DIA:  {fmt_quote(dia)}\n\n"
+        f"\u26a1 <b>WATCHLIST</b>\n"
+        f"TSLA: {fmt_quote(tsla)}\n"
+        f"NVDA: {fmt_quote(nvda)}\n"
+        f"AMD:  {fmt_quote(amd)}\n"
+        f"META: {fmt_quote(meta)}\n"
+        f"GLD:  {fmt_quote(gld)}\n\n"
+        f"\U0001f3b0 <b>OPTIONS (0DTE)</b>\n"
+        f"SPY PCR:      {spy_pcr_str}\n"
+        f"SPY Max Pain: {spy_mp_str}\n"
+        f"SPY ATM IV:   {spy_iv_str}\n"
+        f"QQQ PCR:      {qqq_pcr_str}\n"
+        f"QQQ Max Pain: {qqq_mp_str}\n\n"
+        f"\U0001f5d3 <b>EVENTS TODAY (EST)</b>\n"
+        f"{events_str}\n\n"
+        f"\U0001f3af <b>CONDITIONS</b>\n"
+        f"{conditions}\n\n"
+        f"\U0001f916 <b>JARVIS ANALYSIS</b>\n"
+        f"{ai_bias}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f550 {now_hst.strftime('%H:%M HST')} \u2014 Walk King first \U0001f415"
+    )
     send_telegram(msg)
 
 # ── SETUP QUALITY CHECKER ─────────────────────────────────────────────────────
