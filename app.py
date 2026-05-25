@@ -168,6 +168,115 @@ def pcr_label(pcr):
     if pcr > 0.6:  return f"{pcr} BULLISH LEAN"
     return             f"{pcr} VERY BULLISH"
 
+
+def calc_confluence(dxy, tnx, vix, tlt, xlf, spy, qqq, tsla, nvda, amd, meta, iwm, gld, spy_opts, qqq_opts, events):
+    """Score bullish and bearish confluence 0-10 and return detailed breakdown."""
+    bull = []
+    bear = []
+    neutral = []
+
+    # DXY
+    if dxy:
+        if dxy["pct"] < -0.3:   bull.append("DXY weak — foreign capital flows into equities")
+        elif dxy["pct"] > 0.3:  bear.append("DXY strong — headwind for equities")
+        else:                    neutral.append("DXY flat — no dollar signal")
+
+    # 10Y Yields
+    if tnx:
+        if tnx["pct"] < -0.3:   bull.append("10Y yields falling — easing financial conditions")
+        elif tnx["pct"] > 0.5:  bear.append("10Y yields spiking — pressure on equities")
+        else:                    neutral.append("10Y yields stable")
+
+    # VIX
+    if vix:
+        if vix["price"] < 15:              bull.append("VIX low — calm markets, premium cheap")
+        elif 15 <= vix["price"] <= 20:     bull.append("VIX normal — manageable conditions")
+        elif 20 < vix["price"] <= 25:      bear.append("VIX elevated — reduce size, be selective")
+        else:                              bear.append("VIX high — fear regime, extreme caution")
+
+    # TLT (bonds)
+    if tlt:
+        if tlt["pct"] > 0.3:    bull.append("TLT up — yields falling, bonds rallying")
+        elif tlt["pct"] < -0.3: bear.append("TLT down — yields rising, bonds selling off")
+
+    # XLF (financials lead)
+    if xlf:
+        if xlf["pct"] > 0.3:    bull.append("XLF leading — broad market rally has legs")
+        elif xlf["pct"] < -0.3: bear.append("XLF lagging — financial stress, rally suspect")
+
+    # SPY/QQQ direction
+    bull_tickers = 0
+    bear_tickers = 0
+    for label, d in [("SPY", spy), ("QQQ", qqq), ("TSLA", tsla), ("NVDA", nvda), ("AMD", amd), ("META", meta), ("IWM", iwm)]:
+        if d:
+            if d["pct"] > 0.3:   bull_tickers += 1
+            elif d["pct"] < -0.3: bear_tickers += 1
+
+    if bull_tickers >= 5:    bull.append(f"{bull_tickers}/7 watchlist tickers bullish premarket — strong breadth")
+    elif bull_tickers >= 3:  bull.append(f"{bull_tickers}/7 watchlist tickers bullish — moderate breadth")
+    elif bear_tickers >= 5:  bear.append(f"{bear_tickers}/7 watchlist tickers bearish — broad selling")
+    elif bear_tickers >= 3:  bear.append(f"{bear_tickers}/7 watchlist tickers bearish — distribution")
+
+    # GLD (risk-on/off)
+    if gld:
+        if gld["pct"] < -0.3:   bull.append("Gold down — risk-on, equities preferred")
+        elif gld["pct"] > 0.5:  bear.append("Gold up — risk-off, safe haven bid")
+
+    # PCR
+    if spy_opts["pcr"]:
+        pcr = spy_opts["pcr"]
+        if pcr < 0.7:    bull.append(f"SPY PCR {pcr} — bullish options positioning")
+        elif pcr > 1.2:  bear.append(f"SPY PCR {pcr} — bearish options positioning")
+        else:            neutral.append(f"SPY PCR {pcr} — neutral positioning")
+
+    # Max Pain
+    if spy_opts["max_pain"] and spy and spy["price"]:
+        mp = spy_opts["max_pain"]
+        price = spy["price"]
+        diff_pct = ((mp - price) / price) * 100
+        if diff_pct > 0.3:    bull.append(f"Max Pain ${mp} above price — gravitational pull UP")
+        elif diff_pct < -0.3: bear.append(f"Max Pain ${mp} below price — gravitational pull DOWN")
+
+    # News events
+    red_events = [e for e in events if e[2] == "🔴"]
+    if red_events:
+        bear.append(f"{len(red_events)} high-impact news event(s) today — avoid trading around them")
+    else:
+        bull.append("No major news events — clean tape conditions")
+
+    bull_score = len(bull)
+    bear_score = len(bear)
+    total = bull_score + bear_score
+    net = bull_score - bear_score
+
+    if net >= 5:       bias = "STRONG BULL"; emoji = "🟢🟢"; size_rec = "HIGH CONVICTION — consider sizing up on confirmed London Low sweeps"
+    elif net >= 3:     bias = "BULLISH";     emoji = "🟢";   size_rec = "Lean long — standard 1-2 contracts, look for London Low sweeps"
+    elif net >= 1:     bias = "SLIGHT BULL"; emoji = "🟡";   size_rec = "Mild bull lean — standard size, need clean setup confirmation"
+    elif net == 0:     bias = "NEUTRAL";     emoji = "⚪";   size_rec = "Mixed signals — reduce size, only A+ setups"
+    elif net >= -2:    bias = "SLIGHT BEAR"; emoji = "🟠";   size_rec = "Mild bear lean — standard size, look for London High sweeps"
+    elif net >= -4:    bias = "BEARISH";     emoji = "🔴";   size_rec = "Lean short — standard 1-2 contracts, look for London High sweeps"
+    else:              bias = "STRONG BEAR"; emoji = "🔴🔴"; size_rec = "HIGH CONVICTION — consider sizing up on confirmed London High sweeps"
+
+    return {
+        "bull": bull, "bear": bear, "neutral": neutral,
+        "bull_score": bull_score, "bear_score": bear_score,
+        "net": net, "bias": bias, "emoji": emoji, "size_rec": size_rec
+    }
+
+
+def format_confluence(c):
+    total = c["bull_score"] + c["bear_score"]
+    lines = [
+        f"{c['emoji']} <b>CONFLUENCE: {c['bias']}</b>  ({c['bull_score']} bull / {c['bear_score']} bear)",
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
+    for item in c["bull"]:    lines.append(f"✅ {item}")
+    for item in c["bear"]:    lines.append(f"❌ {item}")
+    for item in c["neutral"]: lines.append(f"⚪ {item}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🎯 {c['size_rec']}")
+    return "\n".join(lines)
+
 def get_ai_analysis(data_summary):
     try:
         r = requests.post(
@@ -237,49 +346,64 @@ TSLA: {p(tsla)} | NVDA: {p(nvda)} | AMD: {p(amd)} | META: {p(meta)} | GLD: {p(gl
 SPY PCR: {spy_opts['pcr']} | SPY Max Pain: {spy_opts['max_pain']} | SPY ATM IV: {spy_opts['atm_iv']}%
 QQQ PCR: {qqq_opts['pcr']} | QQQ Max Pain: {qqq_opts['max_pain']}
 Events: {events_str} | Flags: {" | ".join(flags)}"""
-    ai_bias = get_ai_analysis(data_summary)
+    # Confluence scoring
+    confluence = calc_confluence(dxy, tnx, vix, tlt, xlf, spy, qqq, tsla, nvda, amd, meta, iwm, gld, spy_opts, qqq_opts, events)
+    confluence_str = format_confluence(confluence)
+
+    # AI analysis with confluence context
+    data_summary_with_confluence = data_summary + f"\nBias: {confluence['bias']} ({confluence['bull_score']} bull factors vs {confluence['bear_score']} bear factors)"
+    ai_bias = get_ai_analysis(data_summary_with_confluence)
+
     spy_pcr_str = pcr_label(spy_opts["pcr"])
-    spy_mp_str  = f"${spy_opts['max_pain']}" if spy_opts["max_pain"] else "N/A"
-    spy_iv_str  = f"{spy_opts['atm_iv']}%" if spy_opts["atm_iv"] else "N/A"
+    spy_mp_str  = ("$" + str(spy_opts["max_pain"])) if spy_opts["max_pain"] else "N/A"
+    spy_iv_str  = (str(spy_opts["atm_iv"]) + "%") if spy_opts["atm_iv"] else "N/A"
     qqq_pcr_str = pcr_label(qqq_opts["pcr"])
-    qqq_mp_str  = f"${qqq_opts['max_pain']}" if qqq_opts["max_pain"] else "N/A"
-    msg = (
-        f"\U0001f305 <b>GOOD MORNING MATT</b>\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f4c5 {date_str} | Jarvis Pre-Market Brief\n\n"
-        f"\U0001f4ca <b>MACRO</b>\n"
-        f"DXY:  {fmt_macro(dxy)}\n"
-        f"10Y:  {fmt_macro(tnx, 3)}\n"
-        f"VIX:  {fmt_macro(vix)}\n"
-        f"TLT:  {fmt_quote(tlt)}\n"
-        f"XLF:  {fmt_quote(xlf)}\n\n"
-        f"\U0001f4c8 <b>INDICES</b>\n"
-        f"SPY:  {fmt_quote(spy)}\n"
-        f"QQQ:  {fmt_quote(qqq)}\n"
-        f"IWM:  {fmt_quote(iwm)}\n"
-        f"DIA:  {fmt_quote(dia)}\n\n"
-        f"\u26a1 <b>WATCHLIST</b>\n"
-        f"TSLA: {fmt_quote(tsla)}\n"
-        f"NVDA: {fmt_quote(nvda)}\n"
-        f"AMD:  {fmt_quote(amd)}\n"
-        f"META: {fmt_quote(meta)}\n"
-        f"GLD:  {fmt_quote(gld)}\n\n"
-        f"\U0001f3b0 <b>OPTIONS (0DTE)</b>\n"
-        f"SPY PCR:      {spy_pcr_str}\n"
-        f"SPY Max Pain: {spy_mp_str}\n"
-        f"SPY ATM IV:   {spy_iv_str}\n"
-        f"QQQ PCR:      {qqq_pcr_str}\n"
-        f"QQQ Max Pain: {qqq_mp_str}\n\n"
-        f"\U0001f5d3 <b>EVENTS TODAY (EST)</b>\n"
-        f"{events_str}\n\n"
-        f"\U0001f3af <b>CONDITIONS</b>\n"
-        f"{conditions}\n\n"
-        f"\U0001f916 <b>JARVIS ANALYSIS</b>\n"
-        f"{ai_bias}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f550 {now_hst.strftime('%H:%M HST')} \u2014 Walk King first \U0001f415"
-    )
-    send_telegram(msg)
+    qqq_mp_str  = ("$" + str(qqq_opts["max_pain"])) if qqq_opts["max_pain"] else "N/A"
+
+    # Build message in parts to keep clean
+    parts = []
+    parts.append(f"\U0001f305 <b>GOOD MORNING MATT</b>")
+    parts.append(f"\u2501" * 20)
+    parts.append(f"\U0001f4c5 {date_str} | Jarvis Pre-Market Brief")
+    parts.append("")
+    parts.append(f"\U0001f4ca <b>MACRO</b>")
+    parts.append(f"DXY:  {fmt_macro(dxy)}")
+    parts.append(f"10Y:  {fmt_macro(tnx, 3)}")
+    parts.append(f"VIX:  {fmt_macro(vix)}")
+    parts.append(f"TLT:  {fmt_quote(tlt)}")
+    parts.append(f"XLF:  {fmt_quote(xlf)}")
+    parts.append("")
+    parts.append(f"\U0001f4c8 <b>INDICES</b>")
+    parts.append(f"SPY:  {fmt_quote(spy)}")
+    parts.append(f"QQQ:  {fmt_quote(qqq)}")
+    parts.append(f"IWM:  {fmt_quote(iwm)}")
+    parts.append(f"DIA:  {fmt_quote(dia)}")
+    parts.append("")
+    parts.append(f"\u26a1 <b>WATCHLIST</b>")
+    parts.append(f"TSLA: {fmt_quote(tsla)}")
+    parts.append(f"NVDA: {fmt_quote(nvda)}")
+    parts.append(f"AMD:  {fmt_quote(amd)}")
+    parts.append(f"META: {fmt_quote(meta)}")
+    parts.append(f"GLD:  {fmt_quote(gld)}")
+    parts.append("")
+    parts.append(f"\U0001f3b0 <b>OPTIONS (0DTE)</b>")
+    parts.append(f"SPY PCR:      {spy_pcr_str}")
+    parts.append(f"SPY Max Pain: {spy_mp_str}")
+    parts.append(f"SPY ATM IV:   {spy_iv_str}")
+    parts.append(f"QQQ PCR:      {qqq_pcr_str}")
+    parts.append(f"QQQ Max Pain: {qqq_mp_str}")
+    parts.append("")
+    parts.append(f"\U0001f5d3 <b>EVENTS TODAY (EST)</b>")
+    parts.append(events_str)
+    parts.append("")
+    parts.append(confluence_str)
+    parts.append("")
+    parts.append(f"\U0001f916 <b>JARVIS ANALYSIS</b>")
+    parts.append(ai_bias)
+    parts.append(f"\u2501" * 20)
+    parts.append(now_hst.strftime("%H:%M HST") + " — Walk King first 🐕")
+
+    send_telegram("\n".join(parts))
 
 # ── SETUP QUALITY CHECKER ─────────────────────────────────────────────────────
 SETUP_QUESTIONS = [
