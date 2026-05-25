@@ -431,12 +431,13 @@ def scheduler():
         week  = now_hst.strftime("%Y-%W")
 
         # 8am HST morning brief weekdays
-        if now_hst.hour == 8 and now_hst.minute == 0 and now_hst.weekday() < 5 and morning_sent != today:
-            send_morning_brief()
-            morning_sent = today
+        # 2am HST during DST (Mar-Nov), 3am HST during standard time (Nov-Mar)
+brief_hour = 2 if 3 <= now_hst.month <= 11 else 3
+if now_hst.hour == brief_hour and now_hst.minute == 0 and now_hst.weekday() < 5 and morning_sent != today:
 
-        # Friday 4pm HST weekly report
-        if now_hst.weekday() == 4 and now_hst.hour == 16 and now_hst.minute == 0 and weekly_sent != week:
+
+        # Friday 3pm HST weekly report
+        if now_hst.weekday() == 3 and now_hst.hour == 16 and now_hst.minute == 0 and weekly_sent != week:
             send_weekly_report()
             weekly_sent = week
 
