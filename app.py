@@ -432,8 +432,9 @@ def scheduler():
 
         # 8am HST morning brief weekdays
         # 2am HST during DST (Mar-Nov), 3am HST during standard time (Nov-Mar)
-brief_hour = 2 if 3 <= now_hst.month <= 11 else 3
+brief_hour = 2 if now_hst.month in [3,4,5,6,7,8,9,10,11] else 3
 if now_hst.hour == brief_hour and now_hst.minute == 0 and now_hst.weekday() < 5 and morning_sent != today:
+
 
 
         # Friday 3pm HST weekly report
