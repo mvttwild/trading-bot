@@ -25,7 +25,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 JOURNAL_FILE   = "/tmp/jarvis_journal.json"
 
 HST = timezone(timedelta(hours=-10))
-EST = timezone(timedelta(hours=-5))
+def get_eastern():
+    """Returns EDT (UTC-4) during DST Mar-Nov, EST (UTC-5) Nov-Mar."""
+    month = datetime.now(timezone.utc).month
+    offset = -4 if 3 <= month <= 11 else -5
+    return timezone(timedelta(hours=offset))
+
+EST = get_eastern()  # Updated dynamically in scheduler
 
 # ── PERSISTENT JOURNAL ────────────────────────────────────────────────────────
 def load_journal():
@@ -322,8 +328,10 @@ def send_morning_brief():
     iwm  = fetch_quote("IWM")
     dia  = fetch_quote("DIA")
     gld  = fetch_quote("GLD")
+    # Options chain only available during market hours — N/A at 2am is expected
     spy_opts = fetch_options_data("SPY")
     qqq_opts = fetch_options_data("QQQ")
+    opts_note = "" if spy_opts["pcr"] else "\n⏰ Options data loads at market open (2:30am HST)"
     events     = get_todays_events()
     events_str = format_events(events)
     flags = []
@@ -615,14 +623,35 @@ def format_alert(data: dict) -> str:
     return "\n".join(lines)
 
 # ── BACKGROUND SCHEDULER ──────────────────────────────────────────────────────
+def send_intraday_update():
+    """Fires during market hours if conditions shift significantly."""
+    spy = fetch_quote("SPY")
+    qqq = fetch_quote("QQQ")
+    vix = fetch_quote("^VIX")
+    dxy = fetch_quote("DX-Y.NYB")
+    now = datetime.now(HST)
+    alerts = []
+    if vix and vix["pct"] > 8:   alerts.append(f"VIX SPIKING +{vix['pct']:.1f}% — fear entering the market")
+    if vix and vix["pct"] < -8:  alerts.append(f"VIX DROPPING {vix['pct']:.1f}% — fear fading, conditions improving")
+    if dxy and dxy["pct"] > 0.4: alerts.append(f"DXY SURGING +{dxy['pct']:.1f}% — dollar strength headwind for longs")
+    if dxy and dxy["pct"] < -0.4:alerts.append(f"DXY DROPPING {dxy['pct']:.1f}% — dollar weakness, tailwind for longs")
+    if spy and abs(spy["pct"]) > 1.0: alerts.append(f"SPY MOVING {spy['pct']:+.2f}% — significant intraday shift")
+    if alerts:
+        msg = "⚡ <b>INTRADAY CONDITIONS UPDATE</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "\n".join(alerts)
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n🕐 {now.strftime('%H:%M HST')}"
+        send_telegram(msg)
+
 def scheduler():
     morning_sent = None
     weekly_sent = None
     event_warned = set()
+    last_intraday = None
 
     while True:
         now_hst = datetime.now(HST)
-        now_est = datetime.now(EST)
+        eastern = get_eastern()
+        now_est = datetime.now(eastern)
         today = now_hst.strftime("%Y-%m-%d")
         week  = now_hst.strftime("%Y-%W")
 
@@ -641,17 +670,27 @@ def scheduler():
         if now_hst.hour == 0 and now_hst.minute == 0:
             event_warned.clear()
 
-        # 15-min news warnings
+        # 15-min news warnings (uses dynamic Eastern time — EDT/EST aware)
         for (h, m, imp, name) in get_todays_events():
             if imp == "🔴":
                 event_time = now_est.replace(hour=h, minute=m, second=0, microsecond=0)
                 diff = (event_time - now_est).total_seconds() / 60
-                key = f"{today}_{name}"
-                if 14 <= diff <= 16 and key not in event_warned:
+                key = f"{today}_{name}_warned"
+                if 13 <= diff <= 17 and key not in event_warned:
                     event_warned.add(key)
                     h12 = h % 12 or 12
                     ampm = "AM" if h < 12 else "PM"
-                    send_telegram(f"⚠️ <b>NEWS IN 15 MIN</b>\n🔴 {name}\n🕐 {h12}:{m:02d} {ampm} EST\n\nStay out or tighten stops.")
+                    tz_label = "EDT" if 3 <= now_hst.month <= 11 else "EST"
+                    send_telegram(f"⚠️ <b>NEWS IN 15 MIN</b>\n🔴 {name}\n🕐 {h12}:{m:02d} {ampm} {tz_label}\n\nStay out or tighten stops.")
+
+        # Intraday condition updates every 30 min during market hours (HST)
+        market_open_hst  = 2 if 3 <= now_hst.month <= 11 else 3  # 2:30am DST, 3:30am EST
+        market_close_hst = 10 if 3 <= now_hst.month <= 11 else 11
+        in_market_hours = market_open_hst <= now_hst.hour < market_close_hst
+        intraday_key = now_hst.strftime("%Y-%m-%d-%H-") + str(now_hst.minute // 30)
+        if in_market_hours and now_hst.minute % 30 == 0 and last_intraday != intraday_key:
+            last_intraday = intraday_key
+            threading.Thread(target=send_intraday_update, daemon=True).start()
 
         time.sleep(60)
 
