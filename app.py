@@ -1,5 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Jarvis Trading Bot — Full Suite v3
+# Features:
+#   - Expanded morning brief: SPY, QQQ, TSLA, NVDA, AMD, GLD, META, IWM, DIA
+#   - Macro: DXY, 10Y, VIX, TLT, XLF, GLD
+#   - Persistent trade journal (file-based, survives restarts)
+#   - Setup quality checker (text "check" before a trade)
+#   - Post-trade context logging
+#   - Weekly edge report every Friday 4pm HST
+#   - Two-way commands with threading
+#   - 15-min news warnings
+#   - Alert cooldown
+#   - TradingView webhook alerts
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os, json, requests, threading, time
@@ -14,13 +25,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 JOURNAL_FILE   = "/tmp/jarvis_journal.json"
 
 HST = timezone(timedelta(hours=-10))
-
 def get_eastern():
+    """Returns EDT (UTC-4) during DST Mar-Nov, EST (UTC-5) Nov-Mar."""
     month = datetime.now(timezone.utc).month
     offset = -4 if 3 <= month <= 11 else -5
     return timezone(timedelta(hours=offset))
 
-EST = get_eastern()
+EST = get_eastern()  # Updated dynamically in scheduler
 
 # ── PERSISTENT JOURNAL ────────────────────────────────────────────────────────
 def load_journal():
@@ -30,7 +41,7 @@ def load_journal():
                 return json.load(f)
     except:
         pass
-    return {"wins": 0, "losses": 0, "trades": []}
+    return { "wins": 0, "losses": 0, "trades": [] }
 
 def save_journal(j):
     try:
@@ -41,10 +52,11 @@ def save_journal(j):
 
 journal = load_journal()
 
-check_state     = {}
-trade_log_state = {}
+# ── SETUP CHECK STATE ─────────────────────────────────────────────────────────
+check_state = {}
 
-last_alert       = {}
+# ── COOLDOWN ──────────────────────────────────────────────────────────────────
+last_alert = {}
 COOLDOWN_MINUTES = 15
 
 def is_cooldown(key):
@@ -58,7 +70,7 @@ def is_cooldown(key):
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str):
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    body = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    body = { "chat_id": CHAT_ID, "text": message, "parse_mode": "HTML" }
     try:
         r = requests.post(url, json=body, timeout=10)
         print(f"Telegram: {r.status_code}")
@@ -76,10 +88,10 @@ def fetch_quote(symbol):
         result = d["chart"]["result"][0]
         closes = [c for c in result["indicators"]["quote"][0]["close"] if c]
         curr, prev = closes[-1], closes[-2]
-        pct   = ((curr - prev) / prev) * 100
+        pct = ((curr - prev) / prev) * 100
         arrow = "▲" if curr > prev else "▼"
         color = "🟢" if curr > prev else "🔴"
-        return {"price": curr, "pct": pct, "arrow": arrow, "color": color}
+        return { "price": curr, "pct": pct, "arrow": arrow, "color": color }
     except:
         return None
 
@@ -106,7 +118,7 @@ RECURRING_EVENTS = [
 ]
 
 def get_todays_events():
-    now_est = datetime.now(get_eastern())
+    now_est = datetime.now(EST)
     wd = now_est.weekday()
     events = [(h, m, imp, name) for (w, h, m, imp, name) in RECURRING_EVENTS if w == wd]
     return sorted(events, key=lambda x: x[0]*60+x[1])
@@ -115,18 +127,18 @@ def format_events(events):
     if not events: return "✅ No major events"
     lines = []
     for (h, m, imp, name) in events:
-        h12  = h % 12 or 12
+        h12 = h % 12 or 12
         ampm = "AM" if h < 12 else "PM"
-        lines.append(f"{imp} {h12}:{m:02d} {ampm} EDT — {name}")
+        lines.append(f"{imp} {h12}:{m:02d} {ampm} EST — {name}")
     return "\n".join(lines)
 
-# ── OPTIONS DATA ──────────────────────────────────────────────────────────────
+# ── MORNING BRIEF ─────────────────────────────────────────────────────────────
 def fetch_options_data(symbol):
     try:
         today_ts = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         url = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}?date={today_ts}"
-        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        d   = r.json()
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        d = r.json()
         result = d["optionChain"]["result"][0]
         opts   = result["options"][0]
         calls  = opts.get("calls", [])
@@ -138,92 +150,139 @@ def fetch_options_data(symbol):
         min_pain = float("inf")
         max_pain_strike = None
         for S in all_strikes:
-            cp = sum(max(0, S - c["strike"]) * c.get("openInterest", 0) for c in calls)
-            pp = sum(max(0, p["strike"] - S) * p.get("openInterest", 0) for p in puts)
-            if cp + pp < min_pain:
-                min_pain = cp + pp
+            call_pain = sum(max(0, S - c["strike"]) * c.get("openInterest", 0) for c in calls)
+            put_pain  = sum(max(0, p["strike"] - S) * p.get("openInterest", 0) for p in puts)
+            total = call_pain + put_pain
+            if total < min_pain:
+                min_pain = total
                 max_pain_strike = S
         underlying = result.get("quote", {}).get("regularMarketPrice")
         atm_iv = None
         if underlying and calls:
-            atm   = min(calls, key=lambda c: abs(c["strike"] - underlying))
+            atm = min(calls, key=lambda c: abs(c["strike"] - underlying))
             atm_iv = round(atm.get("impliedVolatility", 0) * 100, 1)
         return {"pcr": pcr, "max_pain": max_pain_strike, "atm_iv": atm_iv}
     except Exception as e:
-        print(f"Options fetch error {symbol}: {e}")
+        print(f"Options fetch error for {symbol}: {e}")
         return {"pcr": None, "max_pain": None, "atm_iv": None}
 
 def pcr_label(pcr):
     if pcr is None: return "N/A"
-    if pcr > 1.5:   return f"{pcr} VERY BEARISH"
-    if pcr > 1.1:   return f"{pcr} BEARISH LEAN"
-    if pcr > 0.85:  return f"{pcr} NEUTRAL"
-    if pcr > 0.6:   return f"{pcr} BULLISH LEAN"
-    return              f"{pcr} VERY BULLISH"
+    if pcr > 1.5:  return f"{pcr} VERY BEARISH"
+    if pcr > 1.1:  return f"{pcr} BEARISH LEAN"
+    if pcr > 0.85: return f"{pcr} NEUTRAL"
+    if pcr > 0.6:  return f"{pcr} BULLISH LEAN"
+    return             f"{pcr} VERY BULLISH"
 
-# ── CONFLUENCE SCORER ─────────────────────────────────────────────────────────
+
 def calc_confluence(dxy, tnx, vix, tlt, xlf, spy, qqq, tsla, nvda, amd, meta, iwm, gld, spy_opts, qqq_opts, events):
-    bull = []; bear = []; neutral = []
+    """Score bullish and bearish confluence 0-10 and return detailed breakdown."""
+    bull = []
+    bear = []
+    neutral = []
+
+    # DXY
     if dxy:
         if dxy["pct"] < -0.3:   bull.append("DXY weak — foreign capital flows into equities")
         elif dxy["pct"] > 0.3:  bear.append("DXY strong — headwind for equities")
-        else:                   neutral.append("DXY flat — no dollar signal")
+        else:                    neutral.append("DXY flat — no dollar signal")
+
+    # 10Y Yields
     if tnx:
         if tnx["pct"] < -0.3:   bull.append("10Y yields falling — easing financial conditions")
         elif tnx["pct"] > 0.5:  bear.append("10Y yields spiking — pressure on equities")
-        else:                   neutral.append("10Y yields stable")
+        else:                    neutral.append("10Y yields stable")
+
+    # VIX
     if vix:
-        if vix["price"] < 15:             bull.append("VIX low — calm markets, premium cheap")
-        elif 15 <= vix["price"] <= 20:    bull.append("VIX normal — manageable conditions")
-        elif 20 < vix["price"] <= 25:     bear.append("VIX elevated — reduce size")
-        else:                             bear.append("VIX high — fear regime, extreme caution")
+        if vix["price"] < 15:              bull.append("VIX low — calm markets, premium cheap")
+        elif 15 <= vix["price"] <= 20:     bull.append("VIX normal — manageable conditions")
+        elif 20 < vix["price"] <= 25:      bear.append("VIX elevated — reduce size, be selective")
+        else:                              bear.append("VIX high — fear regime, extreme caution")
+
+    # TLT (bonds)
     if tlt:
         if tlt["pct"] > 0.3:    bull.append("TLT up — yields falling, bonds rallying")
-        elif tlt["pct"] < -0.3: bear.append("TLT down — yields rising, bonds selling")
+        elif tlt["pct"] < -0.3: bear.append("TLT down — yields rising, bonds selling off")
+
+    # XLF (financials lead)
     if xlf:
-        if xlf["pct"] > 0.3:    bull.append("XLF leading — broad rally has legs")
-        elif xlf["pct"] < -0.3: bear.append("XLF lagging — financial stress")
-    bull_t = sum(1 for _, d in [("SPY",spy),("QQQ",qqq),("TSLA",tsla),("NVDA",nvda),("AMD",amd),("META",meta),("IWM",iwm)] if d and d["pct"] > 0.3)
-    bear_t = sum(1 for _, d in [("SPY",spy),("QQQ",qqq),("TSLA",tsla),("NVDA",nvda),("AMD",amd),("META",meta),("IWM",iwm)] if d and d["pct"] < -0.3)
-    if bull_t >= 5:   bull.append(f"{bull_t}/7 watchlist tickers bullish — strong breadth")
-    elif bull_t >= 3: bull.append(f"{bull_t}/7 watchlist tickers bullish — moderate breadth")
-    elif bear_t >= 5: bear.append(f"{bear_t}/7 watchlist tickers bearish — broad selling")
-    elif bear_t >= 3: bear.append(f"{bear_t}/7 watchlist tickers bearish — distribution")
+        if xlf["pct"] > 0.3:    bull.append("XLF leading — broad market rally has legs")
+        elif xlf["pct"] < -0.3: bear.append("XLF lagging — financial stress, rally suspect")
+
+    # SPY/QQQ direction
+    bull_tickers = 0
+    bear_tickers = 0
+    for label, d in [("SPY", spy), ("QQQ", qqq), ("TSLA", tsla), ("NVDA", nvda), ("AMD", amd), ("META", meta), ("IWM", iwm)]:
+        if d:
+            if d["pct"] > 0.3:   bull_tickers += 1
+            elif d["pct"] < -0.3: bear_tickers += 1
+
+    if bull_tickers >= 5:    bull.append(f"{bull_tickers}/7 watchlist tickers bullish premarket — strong breadth")
+    elif bull_tickers >= 3:  bull.append(f"{bull_tickers}/7 watchlist tickers bullish — moderate breadth")
+    elif bear_tickers >= 5:  bear.append(f"{bear_tickers}/7 watchlist tickers bearish — broad selling")
+    elif bear_tickers >= 3:  bear.append(f"{bear_tickers}/7 watchlist tickers bearish — distribution")
+
+    # GLD (risk-on/off)
     if gld:
-        if gld["pct"] < -0.3:  bull.append("Gold down — risk-on, equities preferred")
-        elif gld["pct"] > 0.5: bear.append("Gold up — risk-off, safe haven bid")
+        if gld["pct"] < -0.3:   bull.append("Gold down — risk-on, equities preferred")
+        elif gld["pct"] > 0.5:  bear.append("Gold up — risk-off, safe haven bid")
+
+    # PCR
     if spy_opts["pcr"]:
         pcr = spy_opts["pcr"]
         if pcr < 0.7:    bull.append(f"SPY PCR {pcr} — bullish options positioning")
         elif pcr > 1.2:  bear.append(f"SPY PCR {pcr} — bearish options positioning")
         else:            neutral.append(f"SPY PCR {pcr} — neutral positioning")
+
+    # Max Pain
     if spy_opts["max_pain"] and spy and spy["price"]:
-        mp   = spy_opts["max_pain"]
-        diff = ((mp - spy["price"]) / spy["price"]) * 100
-        if diff > 0.3:    bull.append(f"Max Pain ${mp} above price — pull UP")
-        elif diff < -0.3: bear.append(f"Max Pain ${mp} below price — pull DOWN")
+        mp = spy_opts["max_pain"]
+        price = spy["price"]
+        diff_pct = ((mp - price) / price) * 100
+        if diff_pct > 0.3:    bull.append(f"Max Pain ${mp} above price — gravitational pull UP")
+        elif diff_pct < -0.3: bear.append(f"Max Pain ${mp} below price — gravitational pull DOWN")
+
+    # News events
     red_events = [e for e in events if e[2] == "🔴"]
-    if red_events: bear.append(f"{len(red_events)} high-impact news event(s) today")
-    else:          bull.append("No major news — clean tape")
-    net = len(bull) - len(bear)
-    if net >= 5:      bias="STRONG BULL"; emoji="🟢🟢"; rec="HIGH CONVICTION — size up on London Low sweeps"
-    elif net >= 3:    bias="BULLISH";     emoji="🟢";   rec="Lean long — 1-2 contracts, London Low sweeps"
-    elif net >= 1:    bias="SLIGHT BULL"; emoji="🟡";   rec="Mild bull lean — need clean setup"
-    elif net == 0:    bias="NEUTRAL";     emoji="⚪";   rec="Mixed — only A+ setups, reduce size"
-    elif net >= -2:   bias="SLIGHT BEAR"; emoji="🟠";   rec="Mild bear lean — London High sweeps"
-    elif net >= -4:   bias="BEARISH";     emoji="🔴";   rec="Lean short — 1-2 contracts, London High sweeps"
-    else:             bias="STRONG BEAR"; emoji="🔴🔴"; rec="HIGH CONVICTION — size up on London High sweeps"
-    return {"bull":bull,"bear":bear,"neutral":neutral,"bull_score":len(bull),"bear_score":len(bear),"net":net,"bias":bias,"emoji":emoji,"size_rec":rec}
+    if red_events:
+        bear.append(f"{len(red_events)} high-impact news event(s) today — avoid trading around them")
+    else:
+        bull.append("No major news events — clean tape conditions")
+
+    bull_score = len(bull)
+    bear_score = len(bear)
+    total = bull_score + bear_score
+    net = bull_score - bear_score
+
+    if net >= 5:       bias = "STRONG BULL"; emoji = "🟢🟢"; size_rec = "HIGH CONVICTION — consider sizing up on confirmed London Low sweeps"
+    elif net >= 3:     bias = "BULLISH";     emoji = "🟢";   size_rec = "Lean long — standard 1-2 contracts, look for London Low sweeps"
+    elif net >= 1:     bias = "SLIGHT BULL"; emoji = "🟡";   size_rec = "Mild bull lean — standard size, need clean setup confirmation"
+    elif net == 0:     bias = "NEUTRAL";     emoji = "⚪";   size_rec = "Mixed signals — reduce size, only A+ setups"
+    elif net >= -2:    bias = "SLIGHT BEAR"; emoji = "🟠";   size_rec = "Mild bear lean — standard size, look for London High sweeps"
+    elif net >= -4:    bias = "BEARISH";     emoji = "🔴";   size_rec = "Lean short — standard 1-2 contracts, look for London High sweeps"
+    else:              bias = "STRONG BEAR"; emoji = "🔴🔴"; size_rec = "HIGH CONVICTION — consider sizing up on confirmed London High sweeps"
+
+    return {
+        "bull": bull, "bear": bear, "neutral": neutral,
+        "bull_score": bull_score, "bear_score": bear_score,
+        "net": net, "bias": bias, "emoji": emoji, "size_rec": size_rec
+    }
+
 
 def format_confluence(c):
-    lines = [f"{c['emoji']} <b>CONFLUENCE: {c['bias']}</b>  ({c['bull_score']} bull / {c['bear_score']} bear)", "━━━━━━━━━━━━━━━━━━━━"]
+    total = c["bull_score"] + c["bear_score"]
+    lines = [
+        f"{c['emoji']} <b>CONFLUENCE: {c['bias']}</b>  ({c['bull_score']} bull / {c['bear_score']} bear)",
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
     for item in c["bull"]:    lines.append(f"✅ {item}")
     for item in c["bear"]:    lines.append(f"❌ {item}")
     for item in c["neutral"]: lines.append(f"⚪ {item}")
-    lines += ["━━━━━━━━━━━━━━━━━━━━", f"🎯 {c['size_rec']}"]
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🎯 {c['size_rec']}")
     return "\n".join(lines)
 
-# ── AI ANALYSIS ───────────────────────────────────────────────────────────────
 def get_ai_analysis(data_summary):
     try:
         r = requests.post(
@@ -232,109 +291,275 @@ def get_ai_analysis(data_summary):
             json={
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 300,
-                "messages": [{"role": "user", "content":
-                    f"You are Jarvis, a sharp 0DTE analyst for Matt Nakamoto trading SPY/QQQ/TSLA/NVDA/AMD/META/IWM/DIA/GLD using ICT London failed break strategy. "
-                    f"Give a 3-4 sentence bias analysis. Direct, actionable, no fluff. State bias, key risk, and whether to trade or stand aside.\n\nDATA:\n{data_summary}"}]
-            }, timeout=20)
-        return r.json()["content"][0]["text"].strip()
+                "messages": [{
+                    "role": "user",
+                    "content": f"""You are Jarvis, a sharp 0DTE options trading analyst for Matt Nakamoto who trades SPY, QQQ, TSLA, NVDA, AMD, META, IWM, DIA and GLD using an ICT London failed break strategy.
+
+Based on this pre-market data give a 3-4 sentence bias analysis. Be direct and actionable.
+State overall directional bias, key risk to watch, and whether conditions favor trading or standing aside today.
+No fluff, no disclaimers. Write like a sharp trading desk analyst texting a colleague.
+
+DATA:
+{data_summary}"""
+                }]
+            },
+            timeout=20
+        )
+        result = r.json()
+        return result["content"][0]["text"].strip()
     except Exception as e:
         print(f"Claude API error: {e}")
         return "AI analysis unavailable — check data manually."
 
-# ── MORNING BRIEF ─────────────────────────────────────────────────────────────
 def send_morning_brief():
-    now_hst  = datetime.now(HST)
+    now_hst = datetime.now(HST)
     date_str = now_hst.strftime("%A %b %d")
-    dxy  = fetch_quote("DX-Y.NYB"); tnx = fetch_quote("^TNX")
-    vix  = fetch_quote("^VIX");     tlt = fetch_quote("TLT")
-    xlf  = fetch_quote("XLF");      spy = fetch_quote("SPY")
-    qqq  = fetch_quote("QQQ");      tsla= fetch_quote("TSLA")
-    nvda = fetch_quote("NVDA");     amd = fetch_quote("AMD")
-    meta = fetch_quote("META");     iwm = fetch_quote("IWM")
-    dia  = fetch_quote("DIA");      gld = fetch_quote("GLD")
+    dxy = fetch_quote("DX-Y.NYB")
+    tnx = fetch_quote("^TNX")
+    vix = fetch_quote("^VIX")
+    tlt = fetch_quote("TLT")
+    xlf = fetch_quote("XLF")
+    spy  = fetch_quote("SPY")
+    qqq  = fetch_quote("QQQ")
+    tsla = fetch_quote("TSLA")
+    nvda = fetch_quote("NVDA")
+    amd  = fetch_quote("AMD")
+    meta = fetch_quote("META")
+    iwm  = fetch_quote("IWM")
+    dia  = fetch_quote("DIA")
+    gld  = fetch_quote("GLD")
+    # Options chain only available during market hours — N/A at 2am is expected
     spy_opts = fetch_options_data("SPY")
     qqq_opts = fetch_options_data("QQQ")
+    opts_note = "" if spy_opts["pcr"] else "\n⏰ Options data loads at market open (2:30am HST)"
     events     = get_todays_events()
     events_str = format_events(events)
-    confluence = calc_confluence(dxy,tnx,vix,tlt,xlf,spy,qqq,tsla,nvda,amd,meta,iwm,gld,spy_opts,qqq_opts,events)
-    conf_str   = format_confluence(confluence)
+    flags = []
+    if vix and vix["price"] > 25:    flags.append("VIX ELEVATED - reduce size")
+    elif vix and vix["price"] > 20:  flags.append("VIX above 20 - be selective")
+    else:                            flags.append("VIX normal range")
+    if dxy and dxy["pct"] > 0.3:    flags.append("DXY pumping - bearish equities")
+    elif dxy and dxy["pct"] < -0.3: flags.append("DXY weak - bullish equities")
+    else:                            flags.append("DXY flat - no signal")
+    if tnx and tnx["pct"] > 0.5:    flags.append("Yields spiking - caution on longs")
+    elif tnx and tnx["pct"] < -0.3: flags.append("Yields falling - bullish tailwind")
+    if gld and gld["pct"] > 0.5:    flags.append("Gold up - risk-off tone")
+    elif gld and gld["pct"] < -0.3: flags.append("Gold down - risk-on tone")
+    if any(e[2] == "🔴" for e in events): flags.append("HIGH IMPACT NEWS TODAY")
+    conditions = "\n".join(flags)
     def p(d, dec=2): return f"{d['price']:.{dec}f} ({d['pct']:+.2f}%)" if d else "N/A"
-    summary = (f"DXY:{p(dxy)} 10Y:{p(tnx,3)} VIX:{p(vix)} TLT:{p(tlt)} XLF:{p(xlf)} "
-               f"SPY:{p(spy)} QQQ:{p(qqq)} TSLA:{p(tsla)} NVDA:{p(nvda)} AMD:{p(amd)} META:{p(meta)} GLD:{p(gld)} "
-               f"SPY_PCR:{spy_opts['pcr']} SPY_MP:{spy_opts['max_pain']} "
-               f"Bias:{confluence['bias']} ({confluence['bull_score']}bull/{confluence['bear_score']}bear)")
-    ai_bias = get_ai_analysis(summary)
-    parts = [
-        "🌅 <b>GOOD MORNING MATT</b>", "━"*20,
-        f"📅 {date_str} | Jarvis Pre-Market Brief", "",
-        "📊 <b>MACRO</b>",
-        f"DXY:  {fmt_macro(dxy)}", f"10Y:  {fmt_macro(tnx,3)}",
-        f"VIX:  {fmt_macro(vix)}", f"TLT:  {fmt_quote(tlt)}", f"XLF:  {fmt_quote(xlf)}", "",
-        "📈 <b>INDICES</b>",
-        f"SPY:  {fmt_quote(spy)}", f"QQQ:  {fmt_quote(qqq)}",
-        f"IWM:  {fmt_quote(iwm)}", f"DIA:  {fmt_quote(dia)}", "",
-        "⚡ <b>WATCHLIST</b>",
-        f"TSLA: {fmt_quote(tsla)}", f"NVDA: {fmt_quote(nvda)}",
-        f"AMD:  {fmt_quote(amd)}",  f"META: {fmt_quote(meta)}", f"GLD:  {fmt_quote(gld)}", "",
-        "🎰 <b>OPTIONS (0DTE)</b>",
-        f"SPY PCR:      {pcr_label(spy_opts['pcr'])}",
-        f"SPY Max Pain: {'$'+str(spy_opts['max_pain']) if spy_opts['max_pain'] else 'N/A'}",
-        f"SPY ATM IV:   {str(spy_opts['atm_iv'])+'%' if spy_opts['atm_iv'] else 'N/A (pre-market)'}",
-        f"QQQ PCR:      {pcr_label(qqq_opts['pcr'])}",
-        f"QQQ Max Pain: {'$'+str(qqq_opts['max_pain']) if qqq_opts['max_pain'] else 'N/A'}", "",
-        "🗓 <b>EVENTS TODAY</b>", events_str, "",
-        conf_str, "",
-        "🤖 <b>JARVIS ANALYSIS</b>", ai_bias,
-        "━"*20,
-        now_hst.strftime("%H:%M HST") + " — Walk King first 🐕"
-    ]
+    data_summary = f"""DXY: {p(dxy)} | 10Y: {p(tnx,3)} | VIX: {p(vix)} | TLT: {p(tlt)} | XLF: {p(xlf)}
+SPY: {p(spy)} | QQQ: {p(qqq)} | IWM: {p(iwm)} | DIA: {p(dia)}
+TSLA: {p(tsla)} | NVDA: {p(nvda)} | AMD: {p(amd)} | META: {p(meta)} | GLD: {p(gld)}
+SPY PCR: {spy_opts['pcr']} | SPY Max Pain: {spy_opts['max_pain']} | SPY ATM IV: {spy_opts['atm_iv']}%
+QQQ PCR: {qqq_opts['pcr']} | QQQ Max Pain: {qqq_opts['max_pain']}
+Events: {events_str} | Flags: {" | ".join(flags)}"""
+    # Confluence scoring
+    confluence = calc_confluence(dxy, tnx, vix, tlt, xlf, spy, qqq, tsla, nvda, amd, meta, iwm, gld, spy_opts, qqq_opts, events)
+    confluence_str = format_confluence(confluence)
+
+    # AI analysis with confluence context
+    data_summary_with_confluence = data_summary + f"\nBias: {confluence['bias']} ({confluence['bull_score']} bull factors vs {confluence['bear_score']} bear factors)"
+    ai_bias = get_ai_analysis(data_summary_with_confluence)
+
+    spy_pcr_str = pcr_label(spy_opts["pcr"])
+    spy_mp_str  = ("$" + str(spy_opts["max_pain"])) if spy_opts["max_pain"] else "N/A"
+    spy_iv_str  = (str(spy_opts["atm_iv"]) + "%") if spy_opts["atm_iv"] else "N/A"
+    qqq_pcr_str = pcr_label(qqq_opts["pcr"])
+    qqq_mp_str  = ("$" + str(qqq_opts["max_pain"])) if qqq_opts["max_pain"] else "N/A"
+
+    # Build message in parts to keep clean
+    parts = []
+    parts.append(f"\U0001f305 <b>GOOD MORNING MATT</b>")
+    parts.append(f"\u2501" * 20)
+    parts.append(f"\U0001f4c5 {date_str} | Jarvis Pre-Market Brief")
+    parts.append("")
+    parts.append(f"\U0001f4ca <b>MACRO</b>")
+    parts.append(f"DXY:  {fmt_macro(dxy)}")
+    parts.append(f"10Y:  {fmt_macro(tnx, 3)}")
+    parts.append(f"VIX:  {fmt_macro(vix)}")
+    parts.append(f"TLT:  {fmt_quote(tlt)}")
+    parts.append(f"XLF:  {fmt_quote(xlf)}")
+    parts.append("")
+    parts.append(f"\U0001f4c8 <b>INDICES</b>")
+    parts.append(f"SPY:  {fmt_quote(spy)}")
+    parts.append(f"QQQ:  {fmt_quote(qqq)}")
+    parts.append(f"IWM:  {fmt_quote(iwm)}")
+    parts.append(f"DIA:  {fmt_quote(dia)}")
+    parts.append("")
+    parts.append(f"\u26a1 <b>WATCHLIST</b>")
+    parts.append(f"TSLA: {fmt_quote(tsla)}")
+    parts.append(f"NVDA: {fmt_quote(nvda)}")
+    parts.append(f"AMD:  {fmt_quote(amd)}")
+    parts.append(f"META: {fmt_quote(meta)}")
+    parts.append(f"GLD:  {fmt_quote(gld)}")
+    parts.append("")
+    parts.append(f"\U0001f3b0 <b>OPTIONS (0DTE)</b>")
+    parts.append(f"SPY PCR:      {spy_pcr_str}")
+    parts.append(f"SPY Max Pain: {spy_mp_str}")
+    parts.append(f"SPY ATM IV:   {spy_iv_str}")
+    parts.append(f"QQQ PCR:      {qqq_pcr_str}")
+    parts.append(f"QQQ Max Pain: {qqq_mp_str}")
+    parts.append("")
+    parts.append(f"\U0001f5d3 <b>EVENTS TODAY (EST)</b>")
+    parts.append(events_str)
+    parts.append("")
+    parts.append(confluence_str)
+    parts.append("")
+    parts.append(f"\U0001f916 <b>JARVIS ANALYSIS</b>")
+    parts.append(ai_bias)
+    parts.append(f"\u2501" * 20)
+    parts.append(now_hst.strftime("%H:%M HST") + " — Walk King first 🐕")
+
     send_telegram("\n".join(parts))
 
-# ── SETUP CHECKER ─────────────────────────────────────────────────────────────
+# ── SETUP CHECKER — Rules-Based 9-Point System ────────────────────────────────
+# Every question must be answered honestly. Score determines size, not just go/no-go.
+
 SETUP_QUESTIONS = [
-    "1️⃣ Is London H/L clearly defined? (yes/no)",
-    "2️⃣ Did price sweep AND close back inside the level? (yes/no)",
-    "3️⃣ Is price action weakness confirmed at level? (yes/no)",
-    "4️⃣ Is VWAP and POC on your side? (yes/no)",
-    "5️⃣ Is VIX below 25 and no news in next 30 min? (yes/no)",
+    ("london_closed",
+     "1️⃣ Has London session closed and H/L levels are locked in?\n"
+     "<i>Need 9:30am EDT minimum — no entries before London closes</i>"),
+
+    ("rotation_done",
+     "2️⃣ Are you at least 5 minutes past NY open (after 9:35am EDT)?\n"
+     "<i>Opening rotation must complete — overnight fills happen at open, wait for the dust to settle</i>"),
+
+    ("level_clear",
+     "3️⃣ Is the London High OR Low a clean, clearly defined level?\n"
+     "<i>Must be distinct — not choppy or multiple overlapping wicks</i>"),
+
+    ("weak_confirmed",
+     "4️⃣ Has WEAK label appeared at the level OR is the failed break clearly visible?\n"
+     "<i>Need at least one: wick rejection, fading candle bodies, or failed push beyond level</i>"),
+
+    ("poc_side",
+     "5️⃣ Is POC on your side of the trade?\n"
+     "<i>LONG: POC above current price — gravity pulling up\n"
+     "SHORT: POC below current price — gravity pulling down\n"
+     "POC above VAH = extra bullish structure</i>"),
+
+    ("confluence",
+     "6️⃣ Is Jarvis morning confluence 3/1 or better in your trade direction?\n"
+     "<i>Check this morning's brief — need at least 3 bull factors for longs, 3 bear for shorts</i>"),
+
+    ("news_clear",
+     "7️⃣ No red high-impact news event in the next 30 minutes?\n"
+     "<i>Jarvis warned you at 15 min — if warning fired, this is a NO</i>"),
+
+    ("vix_ok",
+     "8️⃣ Is VIX below 25?\n"
+     "<i>Above 25 = fear regime, premium expensive, moves erratic — reduce or skip</i>"),
+
+    ("no_emotion",
+     "9️⃣ Are you entering because ALL criteria are met — NOT because you fear missing the move?\n"
+     "<i>Honest answer only. FOMO is not a valid entry reason. If you have to think about it, it's NO.</i>"),
 ]
+
+SIZING_RULES = {
+    9: ("5 contracts MAX",  "🔥 PERFECT — Every rule confirmed. Max size, hold to target."),
+    8: ("3-4 contracts",    "✅ HIGH CONVICTION — Strong setup. Size up, hold plan."),
+    7: ("2-3 contracts",    "✅ GOOD SETUP — Take it with standard size."),
+    6: ("1-2 contracts",    "🟡 ACCEPTABLE — One crack in the setup. Go small."),
+    5: ("1 contract only",  "⚠️ MARGINAL — Two criteria missing. Minimum size or skip."),
+}
+
+EXIT_RULES = """📋 <b>EXIT RULES — non-negotiable:</b>
+• Up 50% before 11am EDT → sell half, hold rest to target
+• Up 80%+ at any time → sell 75%, trail the rest
+• After 1pm EDT → close everything, no exceptions
+• Down 40% from entry → stop out immediately"""
 
 def start_check():
     check_state["active"]  = True
     check_state["answers"] = []
     check_state["q"]       = 0
-    send_telegram(f"🔍 <b>SETUP QUALITY CHECK</b>\n━━━━━━━━━━━━━━━━━━━━\n{SETUP_QUESTIONS[0]}")
+    _, question = SETUP_QUESTIONS[0]
+    send_telegram(f"🔍 <b>SETUP CHECK — 9 RULES</b>\n━━━━━━━━━━━━━━━━━━━━\n{question}\n\nReply: <b>yes</b> or <b>no</b>")
 
 def process_check_answer(text):
     ans = text.strip().lower()
-    if ans not in ["yes","no","y","n"]:
+    if ans not in ["yes", "no", "y", "n"]:
         send_telegram("Reply <b>yes</b> or <b>no</b>")
         return
-    check_state["answers"].append(1 if ans in ["yes","y"] else 0)
+
+    check_state["answers"].append(1 if ans in ["yes", "y"] else 0)
     check_state["q"] += 1
+
     if check_state["q"] < len(SETUP_QUESTIONS):
-        send_telegram(SETUP_QUESTIONS[check_state["q"]])
+        _, question = SETUP_QUESTIONS[check_state["q"]]
+        q_num = check_state["q"] + 1
+        send_telegram(f"{question}\n\nReply: <b>yes</b> or <b>no</b>  ({q_num}/9)")
     else:
         score = sum(check_state["answers"])
         total = len(SETUP_QUESTIONS)
         check_state["active"] = False
-        if score == 5:   grade="A+ 🔥 HIGH CONVICTION — Take it"; col="✅"
-        elif score == 4: grade="B+ 👍 GOOD SETUP — Take it"; col="✅"
-        elif score == 3: grade="C ⚠️ MARGINAL — Reduce size or skip"; col="⚠️"
-        else:            grade="D ❌ WEAK SETUP — Stand aside"; col="❌"
-        criteria = ["London H/L","Sweep confirmed","PA weakness","VWAP/POC aligned","Clean conditions"]
-        missed   = [criteria[i] for i,a in enumerate(check_state["answers"]) if a==0]
-        missed_str = "\n".join([f"❌ {m}" for m in missed]) if missed else "All criteria met"
-        send_telegram(f"""{col} <b>SETUP SCORE: {score}/{total} ({score/total*100:.0f}%)</b>
-━━━━━━━━━━━━━━━━━━━━
-<b>{grade}</b>
 
-<b>Missing:</b>
+        if score >= 9:   sizing, verdict = SIZING_RULES[9]
+        elif score >= 8: sizing, verdict = SIZING_RULES[8]
+        elif score >= 7: sizing, verdict = SIZING_RULES[7]
+        elif score >= 6: sizing, verdict = SIZING_RULES[6]
+        elif score >= 5: sizing, verdict = SIZING_RULES[5]
+        else:
+            sizing  = "0 contracts"
+            verdict = "❌ STAND ASIDE — Too many criteria missing. This is NOT your setup. Walk away."
+
+        missed = []
+        for i, (key, label) in enumerate(SETUP_QUESTIONS):
+            if check_state["answers"][i] == 0:
+                short = label.split("\n")[0]
+                missed.append(f"❌ {short}")
+        missed_str = "\n".join(missed) if missed else "✅ All 9 rules confirmed — textbook setup"
+
+        score_emoji = "🔥" if score >= 8 else "✅" if score >= 6 else "⚠️" if score >= 5 else "❌"
+
+        msg = f"""{score_emoji} <b>SETUP SCORE: {score}/9</b>
+━━━━━━━━━━━━━━━━━━━━
+{verdict}
+
+📊 <b>POSITION SIZE: {sizing}</b>
+
+<b>What's missing:</b>
 {missed_str}
-━━━━━━━━━━━━━━━━━━━━
-🕐 {datetime.now(HST).strftime('%H:%M HST')}""")
+━━━━━━━━━━━━━━━━━━━━"""
 
-# ── BEHAVIORAL TRADE JOURNAL ──────────────────────────────────────────────────
+        if score >= 6:
+            msg += f"\n{EXIT_RULES}\n━━━━━━━━━━━━━━━━━━━━"
+
+        msg += f"\n🕐 {datetime.now(HST).strftime('%H:%M HST')}"
+        send_telegram(msg)
+
+# ── WEEKLY EDGE REPORT ────────────────────────────────────────────────────────
+def send_weekly_report():
+    j = load_journal()
+    total = j["wins"] + j["losses"]
+    wr = (j["wins"] / total * 100) if total > 0 else 0
+    trades = j.get("trades", [])
+
+    # Analyze recent trades
+    recent = trades[-20:] if len(trades) > 20 else trades
+    recent_wins = sum(1 for t in recent if t.get("result") == "win")
+    recent_wr = (recent_wins / len(recent) * 100) if recent else 0
+
+    now = datetime.now(HST)
+    send_telegram(f"""📊 <b>WEEKLY EDGE REPORT</b>
+━━━━━━━━━━━━━━━━━━━━
+Week ending {now.strftime('%b %d, %Y')}
+
+<b>ALL TIME</b>
+✅ Wins:   {j['wins']}
+❌ Losses: {j['losses']}
+📊 Total:  {total}
+🎯 Win Rate: {wr:.1f}%
+
+<b>LAST 20 TRADES</b>
+🎯 Win Rate: {recent_wr:.1f}%
+━━━━━━━━━━━━━━━━━━━━
+Keep executing the system 🤙""")
+
+# ── COMMAND HANDLER ───────────────────────────────────────────────────────────
+
+# ── BEHAVIORAL JOURNAL ────────────────────────────────────────────────────────
 BEHAVIOR_PATTERNS = {
     "sizing":    "Oversized relative to account",
     "fear":      "Fear-based early exit — left money on table",
@@ -347,11 +572,13 @@ BEHAVIOR_PATTERNS = {
     "other":     "Other behavioral issue",
 }
 
+trade_log_state = {}
+
 def start_trade_log():
     trade_log_state.clear()
     trade_log_state["active"] = True
-    trade_log_state["step"]   = 1
-    trade_log_state["data"]   = {}
+    trade_log_state["step"] = 1
+    trade_log_state["data"] = {}
     send_telegram("""📝 <b>TRADE LOG</b>
 ━━━━━━━━━━━━━━━━━━━━
 <b>Step 1/6</b> — Was this your predefined London Failed Break setup?
@@ -361,10 +588,10 @@ Reply: <b>yes</b> or <b>no</b>""")
 def process_trade_log(text):
     step = trade_log_state.get("step", 0)
     data = trade_log_state.get("data", {})
-    t    = text.strip().lower()
+    t = text.strip().lower()
 
     if step == 1:
-        data["on_setup"] = t in ["yes","y"]
+        data["on_setup"] = t in ["yes", "y"]
         trade_log_state["step"] = 2
         send_telegram("""<b>Step 2/6</b> — Result?
 
@@ -380,142 +607,143 @@ Reply: <b>yes</b>, <b>no</b>, or <b>partial</b>""")
     elif step == 3:
         data["followed_exit"] = t
         trade_log_state["step"] = 4
-        send_telegram("""<b>Step 4/6</b> — % of peak unrealized gains captured?
+        send_telegram("""<b>Step 4/6</b> — Estimated % of peak unrealized gains captured?
 
-Reply: <b>100</b>, <b>75</b>, <b>50</b>, <b>25</b>, or <b>0</b>""")
+Reply with a number like <b>100</b>, <b>75</b>, <b>50</b>, <b>25</b>, or <b>0</b>""")
 
     elif step == 4:
-        try:    data["captured_pct"] = int(t.replace("%","").strip())
-        except: data["captured_pct"] = 50
+        try:
+            data["captured_pct"] = int(t.replace("%","").strip())
+        except:
+            data["captured_pct"] = 50
         trade_log_state["step"] = 5
-        pat_list = "\n".join([f"<b>{k}</b> — {v}" for k,v in BEHAVIOR_PATTERNS.items()])
+        pattern_list = "\n".join([f"<b>{k}</b> — {v}" for k, v in BEHAVIOR_PATTERNS.items()])
         send_telegram(f"""<b>Step 5/6</b> — Any behavioral patterns? (or <b>none</b>)
 
-{pat_list}
+{pattern_list}
 
-Reply with keyword(s) e.g. <b>fear profit</b>""")
+Reply with the keyword(s) separated by spaces e.g. <b>fear profit</b>""")
 
     elif step == 5:
-        data["patterns"] = [] if t=="none" else [p for p in t.split() if p in BEHAVIOR_PATTERNS]
+        if t == "none":
+            data["patterns"] = []
+        else:
+            data["patterns"] = [p for p in t.split() if p in BEHAVIOR_PATTERNS]
         trade_log_state["step"] = 6
-        send_telegram("""<b>Step 6/6</b> — One sentence lesson from this trade?""")
+        send_telegram("""<b>Step 6/6</b> — One sentence: what's the lesson from this trade?
+
+Type anything, this is just for you.""")
 
     elif step == 6:
         data["lesson"] = text.strip()
         trade_log_state["active"] = False
-        trade_log_state["step"]   = 0
-        j     = load_journal()
+        trade_log_state["step"] = 0
+
+        # Save to journal
+        j = load_journal()
         entry = {
-            "result":        data.get("result","scratch"),
-            "on_setup":      data.get("on_setup", False),
-            "followed_exit": data.get("followed_exit","no"),
-            "captured_pct":  data.get("captured_pct", 50),
-            "patterns":      data.get("patterns",[]),
-            "lesson":        data.get("lesson",""),
-            "time":          datetime.now(HST).isoformat(),
+            "result":       data.get("result", "scratch"),
+            "on_setup":     data.get("on_setup", False),
+            "followed_exit":data.get("followed_exit", "no"),
+            "captured_pct": data.get("captured_pct", 50),
+            "patterns":     data.get("patterns", []),
+            "lesson":       data.get("lesson", ""),
+            "time":         datetime.now(HST).isoformat(),
         }
-        if not isinstance(j.get("trades"), list): j["trades"] = []
+        if not isinstance(j.get("trades"), list):
+            j["trades"] = []
         j["trades"].append(entry)
+
+        # Update win/loss count (only count on-setup trades)
         if data.get("on_setup"):
-            if data.get("result") == "win":   j["wins"]     = j.get("wins",0)     + 1
-            elif data.get("result") == "loss": j["losses"]   = j.get("losses",0)   + 1
+            if data.get("result") == "win":
+                j["wins"] = j.get("wins", 0) + 1
+            elif data.get("result") == "loss":
+                j["losses"] = j.get("losses", 0) + 1
         else:
-            j["off_plan"] = j.get("off_plan",0) + 1
+            j["off_plan"] = j.get("off_plan", 0) + 1
+
         save_journal(j)
-        total_sys = j.get("wins",0) + j.get("losses",0)
-        sys_wr    = (j["wins"] / total_sys * 100) if total_sys > 0 else 0
-        cap       = data.get("captured_pct",50)
-        cap_emoji = "🔥" if cap >= 80 else "⚠️" if cap >= 50 else "❌"
-        pat_str   = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS[p]}" for p in data.get("patterns",[])]) or "✅ No behavioral issues"
+
+        # Score summary
+        total_system = j.get("wins", 0) + j.get("losses", 0)
+        system_wr = (j["wins"] / total_system * 100) if total_system > 0 else 0
+        off_plan = j.get("off_plan", 0)
+
+        patterns_str = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS[p]}" for p in data.get("patterns", [])]) or "✅ No behavioral issues"
         setup_str = "✅ ON SETUP — counts toward edge" if data.get("on_setup") else "⚪ OFF PLAN — not counted toward edge win rate"
+        captured = data.get("captured_pct", 50)
+        captured_emoji = "🔥" if captured >= 80 else "⚠️" if captured >= 50 else "❌"
+
         send_telegram(f"""📋 <b>TRADE LOGGED</b>
 ━━━━━━━━━━━━━━━━━━━━
 {setup_str}
 Result: <b>{data.get("result","scratch").upper()}</b>
 Exit plan followed: {data.get("followed_exit","?")}
-{cap_emoji} Gains captured: {cap}%
+{captured_emoji} Gains captured: {captured}%
 
 <b>Behavior:</b>
-{pat_str}
+{patterns_str}
 
 <b>Lesson:</b>
 <i>{data.get("lesson","")}</i>
 ━━━━━━━━━━━━━━━━━━━━
-📊 System: {j.get("wins",0)}W / {j.get("losses",0)}L ({sys_wr:.1f}% WR)
-⚪ Off-plan trades: {j.get("off_plan",0)}""")
+📊 System trades: {j.get("wins",0)}W / {j.get("losses",0)}L ({system_wr:.1f}% WR)
+⚪ Off-plan trades: {off_plan}""")
 
 def show_patterns():
-    j      = load_journal()
-    trades = [t for t in j.get("trades",[]) if isinstance(t,dict) and "patterns" in t]
+    """Analyze behavioral patterns from journal."""
+    j = load_journal()
+    trades = [t for t in j.get("trades", []) if isinstance(t, dict) and "patterns" in t]
     if not trades:
         send_telegram("No trade data yet. Log trades with the <b>trade</b> command.")
         return
-    pat_counts = {}
+
+    # Count patterns
+    pattern_counts = {}
     for t in trades:
-        for p in t.get("patterns",[]): pat_counts[p] = pat_counts.get(p,0) + 1
-    captured  = [t.get("captured_pct",100) for t in trades if "captured_pct" in t]
-    avg_cap   = sum(captured)/len(captured) if captured else 100
+        for p in t.get("patterns", []):
+            pattern_counts[p] = pattern_counts.get(p, 0) + 1
+
+    # Avg captured pct
+    captured = [t.get("captured_pct", 100) for t in trades if "captured_pct" in t]
+    avg_captured = sum(captured) / len(captured) if captured else 100
+
+    # System vs off-plan
     on_setup  = [t for t in trades if t.get("on_setup")]
     off_plan  = [t for t in trades if not t.get("on_setup")]
-    on_wr     = (sum(1 for t in on_setup if t.get("result")=="win") / len(on_setup) * 100) if on_setup else 0
-    off_wr    = (sum(1 for t in off_plan if t.get("result")=="win") / len(off_plan) * 100) if off_plan else 0
-    pat_str   = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS.get(k,k)}: {v}x" for k,v in sorted(pat_counts.items(),key=lambda x:x[1],reverse=True)]) or "✅ No recurring patterns yet"
+    on_wins   = sum(1 for t in on_setup  if t.get("result") == "win")
+    off_wins  = sum(1 for t in off_plan  if t.get("result") == "win")
+    on_wr     = (on_wins  / len(on_setup)  * 100) if on_setup  else 0
+    off_wr    = (off_wins / len(off_plan)  * 100) if off_plan  else 0
+
+    sorted_patterns = sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)
+    pattern_str = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS.get(k,k)}: {v}x" for k,v in sorted_patterns]) or "✅ No recurring patterns yet"
+
     send_telegram(f"""🧠 <b>BEHAVIORAL PATTERN REPORT</b>
 ━━━━━━━━━━━━━━━━━━━━
-<b>SYSTEM (on-setup):</b> {len(on_setup)} trades — {on_wr:.1f}% WR
-<b>OFF-PLAN:</b> {len(off_plan)} trades — {off_wr:.1f}% WR
-<b>Avg gains captured:</b> {avg_cap:.0f}%
+<b>SYSTEM (on-setup) trades:</b> {len(on_setup)}
+🎯 Win rate: {on_wr:.1f}%
+
+<b>OFF-PLAN (discretionary) trades:</b> {len(off_plan)}
+🎯 Win rate: {off_wr:.1f}%
+
+<b>Average gains captured:</b> {avg_captured:.0f}%
 
 <b>Recurring behaviors:</b>
-{pat_str}
+{pattern_str}
 ━━━━━━━━━━━━━━━━━━━━
 <i>Your edge shows in system trades.
 Off-plan trades are where the account bleeds.</i>""")
 
-# ── WEEKLY REPORT ─────────────────────────────────────────────────────────────
-def send_weekly_report():
-    j     = load_journal()
-    total = j["wins"] + j["losses"]
-    wr    = (j["wins"] / total * 100) if total > 0 else 0
-    recent = j.get("trades",[])[-20:]
-    rw     = sum(1 for t in recent if t.get("result")=="win")
-    rwr    = (rw/len(recent)*100) if recent else 0
-    now    = datetime.now(HST)
-    send_telegram(f"""📊 <b>WEEKLY EDGE REPORT</b>
-━━━━━━━━━━━━━━━━━━━━
-Week ending {now.strftime('%b %d, %Y')}
 
-<b>ALL TIME</b>
-✅ Wins:   {j['wins']}
-❌ Losses: {j['losses']}
-📊 Total:  {total}
-🎯 Win Rate: {wr:.1f}%
-
-<b>LAST 20 TRADES</b>
-🎯 Win Rate: {rwr:.1f}%
-━━━━━━━━━━━━━━━━━━━━
-Keep executing the system 🤙""")
-
-# ── INTRADAY UPDATE ───────────────────────────────────────────────────────────
-def send_intraday_update():
-    spy = fetch_quote("SPY"); qqq = fetch_quote("QQQ")
-    vix = fetch_quote("^VIX"); dxy = fetch_quote("DX-Y.NYB")
-    now = datetime.now(HST)
-    alerts = []
-    if vix and vix["pct"] > 8:    alerts.append(f"VIX SPIKING +{vix['pct']:.1f}% — fear entering market")
-    if vix and vix["pct"] < -8:   alerts.append(f"VIX DROPPING {vix['pct']:.1f}% — fear fading")
-    if dxy and dxy["pct"] > 0.4:  alerts.append(f"DXY SURGING +{dxy['pct']:.1f}% — headwind for longs")
-    if dxy and dxy["pct"] < -0.4: alerts.append(f"DXY DROPPING {dxy['pct']:.1f}% — tailwind for longs")
-    if spy and abs(spy["pct"]) > 1.0: alerts.append(f"SPY MOVING {spy['pct']:+.2f}% — significant shift")
-    if alerts:
-        send_telegram("⚡ <b>INTRADAY UPDATE</b>\n━━━━━━━━━━━━━━━━━━━━\n" +
-                      "\n".join(alerts) + f"\n━━━━━━━━━━━━━━━━━━━━\n🕐 {now.strftime('%H:%M HST')}")
-
-# ── COMMAND HANDLER ───────────────────────────────────────────────────────────
 def handle_command(text: str):
+    # If trade log is active, process it
     if trade_log_state.get("active"):
         process_trade_log(text)
         return
+
+    # If setup check is active, process answers
     if check_state.get("active"):
         process_check_answer(text)
         return
@@ -523,15 +751,24 @@ def handle_command(text: str):
     cmd = text.strip().lower()
 
     if cmd == "trade":
+        trade_log_state["active"] = True
         start_trade_log()
+        return
+
     elif cmd == "patterns":
         show_patterns()
-    elif cmd in ["brief","morning","gm"]:
+        return
+
+    if cmd in ["brief", "morning", "gm"]:
         send_morning_brief()
+
     elif cmd == "levels":
-        spy=fetch_quote("SPY"); qqq=fetch_quote("QQQ")
-        dxy=fetch_quote("DX-Y.NYB"); vix=fetch_quote("^VIX"); gld=fetch_quote("GLD")
-        now=datetime.now(HST)
+        spy = fetch_quote("SPY")
+        qqq = fetch_quote("QQQ")
+        dxy = fetch_quote("DX-Y.NYB")
+        vix = fetch_quote("^VIX")
+        gld = fetch_quote("GLD")
+        now = datetime.now(HST)
         send_telegram(f"""📊 <b>LIVE LEVELS</b>
 ━━━━━━━━━━━━━━━━━━━━
 SPY:  {fmt_quote(spy)}
@@ -541,107 +778,172 @@ DXY:  {fmt_macro(dxy)}
 VIX:  {fmt_macro(vix)}
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now.strftime('%H:%M HST')}""")
+
     elif cmd == "check":
         start_check()
-    elif cmd in ["win","w"]:
+
+    elif cmd in ["win", "w"]:
         journal["wins"] += 1
-        journal["trades"].append({"result":"win","time":datetime.now(HST).isoformat()})
+        journal["trades"].append({"result": "win", "time": datetime.now(HST).isoformat()})
         save_journal(journal)
         total = journal["wins"] + journal["losses"]
-        wr    = (journal["wins"]/total*100) if total > 0 else 0
-        send_telegram(f"✅ <b>WIN logged!</b>\nRecord: {journal['wins']}W / {journal['losses']}L\nWin Rate: {wr:.1f}%\nTotal: {total}/100")
-    elif cmd in ["loss","l"]:
+        wr = (journal["wins"] / total * 100) if total > 0 else 0
+        send_telegram(f"✅ <b>WIN logged!</b>\nRecord: {journal['wins']}W / {journal['losses']}L\nWin Rate: {wr:.1f}%\nTotal trades: {total}/100")
+
+    elif cmd in ["loss", "l"]:
         journal["losses"] += 1
-        journal["trades"].append({"result":"loss","time":datetime.now(HST).isoformat()})
+        journal["trades"].append({"result": "loss", "time": datetime.now(HST).isoformat()})
         save_journal(journal)
         total = journal["wins"] + journal["losses"]
-        wr    = (journal["wins"]/total*100) if total > 0 else 0
-        send_telegram(f"❌ <b>LOSS logged.</b>\nRecord: {journal['wins']}W / {journal['losses']}L\nWin Rate: {wr:.1f}%\nTotal: {total}/100")
-    elif cmd in ["stats","record","journal"]:
+        wr = (journal["wins"] / total * 100) if total > 0 else 0
+        send_telegram(f"❌ <b>LOSS logged.</b>\nRecord: {journal['wins']}W / {journal['losses']}L\nWin Rate: {wr:.1f}%\nTotal trades: {total}/100")
+
+    elif cmd in ["stats", "record", "journal"]:
         total = journal["wins"] + journal["losses"]
-        wr    = (journal["wins"]/total*100) if total > 0 else 0
+        wr = (journal["wins"] / total * 100) if total > 0 else 0
+        remaining = max(0, 100 - total)
         send_telegram(f"""📋 <b>TRADE JOURNAL</b>
 ━━━━━━━━━━━━━━━━━━━━
 ✅ Wins:      {journal['wins']}
 ❌ Losses:    {journal['losses']}
 📊 Total:     {total}/100
 🎯 Win Rate:  {wr:.1f}%
-📍 Remaining: {max(0,100-total)} trades
+📍 Remaining: {remaining} trades
 ━━━━━━━━━━━━━━━━━━━━""")
-    elif cmd in ["status","ping"]:
-        now   = datetime.now(HST)
+
+    elif cmd in ["status", "ping"]:
+        now = datetime.now(HST)
         total = journal["wins"] + journal["losses"]
-        send_telegram(f"✅ <b>Jarvis online</b>\n🕐 {now.strftime('%H:%M HST')}\n📡 Railway active\n📊 Trades: {total}/100")
+        send_telegram(f"✅ <b>Jarvis is online</b>\n🕐 {now.strftime('%H:%M HST')}\n📡 Railway server active\n📊 Trades logged: {total}/100")
+
     elif cmd == "report":
         send_weekly_report()
+
     elif cmd == "help":
         send_telegram("""🤖 <b>JARVIS COMMANDS</b>
 ━━━━━━━━━━━━━━━━━━━━
 <b>brief</b> — full pre-market brief
 <b>levels</b> — live SPY/QQQ/GLD/DXY/VIX
-<b>check</b> — setup quality scorer
+<b>check</b> — setup quality scorer before entry
 <b>trade</b> — log trade with behavioral metrics
-<b>patterns</b> — behavioral pattern report
-<b>stats</b> — journal + progress to 100
+<b>patterns</b> — see your behavioral pattern report
+<b>stats</b> — trade journal + progress to 100
 <b>report</b> — weekly edge report
 <b>status</b> — confirm Jarvis is online
-━━━━━━━━━━━━━━━━━━━━""")
+━━━━━━━━━━━━━━━━━━━━
+<i>win/loss still work for quick logging.
+Use trade for full behavioral breakdown.</i>""")
 
 # ── ALERT FORMATTER ───────────────────────────────────────────────────────────
 def format_alert(data: dict) -> str:
-    signal  = data.get("signal","SIGNAL"); ticker = data.get("ticker","SPY")
-    price   = data.get("price","");        target = data.get("target","")
-    ldn_h   = data.get("ldnHigh","");      ldn_l  = data.get("ldnLow","")
-    poc     = data.get("poc","");          side   = data.get("side","")
+    signal  = data.get("signal", "SIGNAL")
+    ticker  = data.get("ticker", "SPY")
+    side    = data.get("side", "")
+    price   = data.get("price", "")
+    target  = data.get("target", "")
+    ldn_h   = data.get("ldnHigh", "")
+    ldn_l   = data.get("ldnLow", "")
+    poc     = data.get("poc", "")
     now_hst = datetime.now(HST)
-    if "SWEEP HIGH" in signal.upper():   emoji="⚡🔴"; side_str="SHORT ↓"; action="Failed break above London High — expansion toward London Low"
-    elif "SWEEP LOW" in signal.upper():  emoji="⚡🟢"; side_str="LONG ↑";  action="Failed break below London Low — expansion toward London High"
-    elif "TARGET HIT" in signal.upper(): emoji="✅";   side_str="";         action="Target reached — consider closing"
-    elif "WEAK" in signal.upper():       emoji="⚠️";   side_str="";         action="Price action weakness at London level"
-    else:                                emoji="📊";   side_str=side;       action=signal
-    lines = [f"{emoji} <b>{signal}</b>","━━━━━━━━━━━━━━━━━━━━"]
-    if ticker: lines.append(f"📈 <b>{ticker}</b>  {side_str}")
-    if price:  lines.append(f"💰 Price:    <code>${price}</code>")
-    if target: lines.append(f"🎯 Target:   <code>${target}</code>")
-    if ldn_h:  lines.append(f"🔴 LDN High: <code>${ldn_h}</code>")
-    if ldn_l:  lines.append(f"🟢 LDN Low:  <code>${ldn_l}</code>")
-    if poc:    lines.append(f"🟠 POC:      <code>${poc}</code>")
-    lines += ["━━━━━━━━━━━━━━━━━━━━", f"<i>{action}</i>",
-              f"🕐 {now_hst.strftime('%H:%M HST')}", "\nText <b>check</b> before entering"]
+
+    if "SWEEP HIGH" in signal.upper():
+        emoji = "⚡🔴"; side_str = "SHORT ↓"
+        action = "Failed break above London High — expansion toward London Low"
+    elif "SWEEP LOW" in signal.upper():
+        emoji = "⚡🟢"; side_str = "LONG ↑"
+        action = "Failed break below London Low — expansion toward London High"
+    elif "TARGET HIT" in signal.upper():
+        emoji = "✅"; side_str = ""
+        action = "Target reached — consider closing"
+    elif "WEAK" in signal.upper():
+        emoji = "⚠️"; side_str = ""
+        action = "Price action weakness at London level"
+    else:
+        emoji = "📊"; side_str = side; action = signal
+
+    lines = [f"{emoji} <b>{signal}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    if ticker:  lines.append(f"📈 <b>{ticker}</b>  {side_str}")
+    if price:   lines.append(f"💰 Price:    <code>${price}</code>")
+    if target:  lines.append(f"🎯 Target:   <code>${target}</code>")
+    if ldn_h:   lines.append(f"🔴 LDN High: <code>${ldn_h}</code>")
+    if ldn_l:   lines.append(f"🟢 LDN Low:  <code>${ldn_l}</code>")
+    if poc:     lines.append(f"🟠 POC:      <code>${poc}</code>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<i>{action}</i>")
+    lines.append(f"🕐 {now_hst.strftime('%H:%M HST')}")
+    lines.append(f"\nText <b>check</b> to score this setup before entering")
     return "\n".join(lines)
 
-# ── SCHEDULER ─────────────────────────────────────────────────────────────────
+# ── BACKGROUND SCHEDULER ──────────────────────────────────────────────────────
+def send_intraday_update():
+    """Fires during market hours if conditions shift significantly."""
+    spy = fetch_quote("SPY")
+    qqq = fetch_quote("QQQ")
+    vix = fetch_quote("^VIX")
+    dxy = fetch_quote("DX-Y.NYB")
+    now = datetime.now(HST)
+    alerts = []
+    if vix and vix["pct"] > 8:   alerts.append(f"VIX SPIKING +{vix['pct']:.1f}% — fear entering the market")
+    if vix and vix["pct"] < -8:  alerts.append(f"VIX DROPPING {vix['pct']:.1f}% — fear fading, conditions improving")
+    if dxy and dxy["pct"] > 0.4: alerts.append(f"DXY SURGING +{dxy['pct']:.1f}% — dollar strength headwind for longs")
+    if dxy and dxy["pct"] < -0.4:alerts.append(f"DXY DROPPING {dxy['pct']:.1f}% — dollar weakness, tailwind for longs")
+    if spy and abs(spy["pct"]) > 1.0: alerts.append(f"SPY MOVING {spy['pct']:+.2f}% — significant intraday shift")
+    if alerts:
+        msg = "⚡ <b>INTRADAY CONDITIONS UPDATE</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "\n".join(alerts)
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n🕐 {now.strftime('%H:%M HST')}"
+        send_telegram(msg)
+
 def scheduler():
-    morning_sent=None; weekly_sent=None; event_warned=set(); last_intraday=None
+    morning_sent = None
+    weekly_sent = None
+    event_warned = set()
+    last_intraday = None
+
     while True:
         now_hst = datetime.now(HST)
-        now_est = datetime.now(get_eastern())
-        today   = now_hst.strftime("%Y-%m-%d")
-        week    = now_hst.strftime("%Y-%W")
+        eastern = get_eastern()
+        now_est = datetime.now(eastern)
+        today = now_hst.strftime("%Y-%m-%d")
+        week  = now_hst.strftime("%Y-%W")
+
+        # 8am HST morning brief weekdays
         brief_hour = 2 if now_hst.month in [3,4,5,6,7,8,9,10,11] else 3
-        if now_hst.hour==brief_hour and now_hst.minute==0 and now_hst.weekday()<5 and morning_sent!=today:
-            threading.Thread(target=send_morning_brief, daemon=True).start()
+        if now_hst.hour == brief_hour and now_hst.minute == 0 and now_hst.weekday() < 5 and morning_sent != today:
+            send_morning_brief()
             morning_sent = today
-        if now_hst.weekday()==4 and now_hst.hour==16 and now_hst.minute==0 and weekly_sent!=week:
-            send_weekly_report(); weekly_sent = week
-        if now_hst.hour==0 and now_hst.minute==0:
+
+        # Friday 4pm HST weekly report
+        if now_hst.weekday() == 4 and now_hst.hour == 16 and now_hst.minute == 0 and weekly_sent != week:
+            send_weekly_report()
+            weekly_sent = week
+
+        # Reset event warnings daily
+        if now_hst.hour == 0 and now_hst.minute == 0:
             event_warned.clear()
-        for (h,m,imp,name) in get_todays_events():
-            if imp=="🔴":
-                event_time = now_est.replace(hour=h,minute=m,second=0,microsecond=0)
-                diff = (event_time - now_est).total_seconds()/60
-                key  = f"{today}_{name}_warned"
+
+        # 15-min news warnings (uses dynamic Eastern time — EDT/EST aware)
+        for (h, m, imp, name) in get_todays_events():
+            if imp == "🔴":
+                event_time = now_est.replace(hour=h, minute=m, second=0, microsecond=0)
+                diff = (event_time - now_est).total_seconds() / 60
+                key = f"{today}_{name}_warned"
                 if 13 <= diff <= 17 and key not in event_warned:
                     event_warned.add(key)
-                    h12=h%12 or 12; ampm="AM" if h<12 else "PM"
-                    tz_label="EDT" if 3<=now_hst.month<=11 else "EST"
+                    h12 = h % 12 or 12
+                    ampm = "AM" if h < 12 else "PM"
+                    tz_label = "EDT" if 3 <= now_hst.month <= 11 else "EST"
                     send_telegram(f"⚠️ <b>NEWS IN 15 MIN</b>\n🔴 {name}\n🕐 {h12}:{m:02d} {ampm} {tz_label}\n\nStay out or tighten stops.")
-        moh = 2 if 3<=now_hst.month<=11 else 3
-        mch = 10 if 3<=now_hst.month<=11 else 11
-        ikey = now_hst.strftime("%Y-%m-%d-%H-") + str(now_hst.minute//30)
-        if moh<=now_hst.hour<mch and now_hst.minute%30==0 and last_intraday!=ikey:
-            last_intraday=ikey
+
+        # Intraday condition updates every 30 min during market hours (HST)
+        market_open_hst  = 2 if 3 <= now_hst.month <= 11 else 3  # 2:30am DST, 3:30am EST
+        market_close_hst = 10 if 3 <= now_hst.month <= 11 else 11
+        in_market_hours = market_open_hst <= now_hst.hour < market_close_hst
+        intraday_key = now_hst.strftime("%Y-%m-%d-%H-") + str(now_hst.minute // 30)
+        if in_market_hours and now_hst.minute % 30 == 0 and last_intraday != intraday_key:
+            last_intraday = intraday_key
             threading.Thread(target=send_intraday_update, daemon=True).start()
+
         time.sleep(60)
 
 threading.Thread(target=scheduler, daemon=True).start()
@@ -650,39 +952,54 @@ threading.Thread(target=scheduler, daemon=True).start()
 @app.route("/telegram", methods=["POST"])
 def telegram_incoming():
     data = request.get_json(silent=True) or {}
-    text = data.get("message",{}).get("text","")
+    text = data.get("message", {}).get("text", "")
     if text:
-        threading.Thread(target=handle_command, args=(text,), daemon=True).start()
+        t = threading.Thread(target=handle_command, args=(text,))
+        t.start()
     return jsonify({"ok": True}), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if WEBHOOK_SECRET and request.args.get("secret","") != WEBHOOK_SECRET:
-        return jsonify({"error":"Unauthorized"}), 401
+    if WEBHOOK_SECRET:
+        if request.args.get("secret", "") != WEBHOOK_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
     raw = request.get_data(as_text=True)
-    try:    data = json.loads(raw)
-    except: data = {"signal": raw.strip()}
+    try:
+        data = json.loads(raw)
+    except:
+        data = {"signal": raw.strip()}
     key = f"{data.get('ticker','SPY')}_{data.get('signal','')}"
-    if is_cooldown(key): return jsonify({"status":"cooldown"}), 200
-    success = send_telegram(format_alert(data))
-    return jsonify({"status":"sent" if success else "error"}), 200 if success else 500
+    if is_cooldown(key):
+        return jsonify({"status": "cooldown"}), 200
+    msg = format_alert(data)
+    success = send_telegram(msg)
+    return jsonify({"status": "sent" if success else "error"}), 200 if success else 500
 
 @app.route("/test", methods=["GET"])
 def test():
-    success = send_telegram(format_alert({"signal":"SWEEP HIGH","ticker":"SPY","side":"SHORT","price":"589.45","target":"585.90","ldnHigh":"589.45","ldnLow":"585.90","poc":"587.20"}))
-    return jsonify({"status":"sent" if success else "failed"}), 200
+    msg = format_alert({
+        "signal": "SWEEP HIGH", "ticker": "SPY", "side": "SHORT",
+        "price": "589.45", "target": "585.90",
+        "ldnHigh": "589.45", "ldnLow": "585.90", "poc": "587.20"
+    })
+    success = send_telegram(msg)
+    return jsonify({"status": "sent" if success else "failed"}), 200
 
 @app.route("/testbrief", methods=["GET"])
 def test_brief():
-    threading.Thread(target=send_morning_brief, daemon=True).start()
-    return jsonify({"status":"brief sending"}), 200
+    threading.Thread(target=send_morning_brief).start()
+    return jsonify({"status": "brief sending"}), 200
 
 @app.route("/", methods=["GET"])
 def health():
-    j     = load_journal()
+    j = load_journal()
     total = j["wins"] + j["losses"]
-    wr    = (j["wins"]/total*100) if total > 0 else 0
-    return jsonify({"status":"online","bot":"Jarvis v3","time_hst":datetime.now(HST).strftime("%H:%M HST"),"journal":{"wins":j["wins"],"losses":j["losses"],"total":total,"win_rate":f"{wr:.1f}%"}}), 200
+    wr = (j["wins"] / total * 100) if total > 0 else 0
+    return jsonify({
+        "status": "online", "bot": "Jarvis v3",
+        "time_hst": datetime.now(HST).strftime("%H:%M HST"),
+        "journal": { "wins": j["wins"], "losses": j["losses"], "total": total, "win_rate": f"{wr:.1f}%" },
+    }), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
