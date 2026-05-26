@@ -501,13 +501,205 @@ Week ending {now.strftime('%b %d, %Y')}
 Keep executing the system 🤙""")
 
 # ── COMMAND HANDLER ───────────────────────────────────────────────────────────
+
+# ── BEHAVIORAL JOURNAL ────────────────────────────────────────────────────────
+BEHAVIOR_PATTERNS = {
+    "sizing":    "Oversized relative to account",
+    "fear":      "Fear-based early exit — left money on table",
+    "revenge":   "Revenge trade after a loss",
+    "fomo":      "FOMO entry — chased price",
+    "noexit":    "No predefined exit — winged it",
+    "emotional": "Added money from external account emotionally",
+    "deviated":  "Deviated from predefined setup/plan",
+    "profit":    "Failed to take profits at target",
+    "other":     "Other behavioral issue",
+}
+
+trade_log_state = {}
+
+def start_trade_log():
+    trade_log_state.clear()
+    trade_log_state["step"] = 1
+    trade_log_state["data"] = {}
+    send_telegram("""📝 <b>TRADE LOG</b>
+━━━━━━━━━━━━━━━━━━━━
+<b>Step 1/6</b> — Was this your predefined London Failed Break setup?
+
+Reply: <b>yes</b> or <b>no</b>""")
+
+def process_trade_log(text):
+    step = trade_log_state.get("step", 0)
+    data = trade_log_state.get("data", {})
+    t = text.strip().lower()
+
+    if step == 1:
+        data["on_setup"] = t in ["yes", "y"]
+        trade_log_state["step"] = 2
+        send_telegram("""<b>Step 2/6</b> — Result?
+
+Reply: <b>win</b>, <b>loss</b>, or <b>scratch</b>""")
+
+    elif step == 2:
+        data["result"] = t if t in ["win","loss","scratch"] else "scratch"
+        trade_log_state["step"] = 3
+        send_telegram("""<b>Step 3/6</b> — Did you follow your exit plan?
+
+Reply: <b>yes</b>, <b>no</b>, or <b>partial</b>""")
+
+    elif step == 3:
+        data["followed_exit"] = t
+        trade_log_state["step"] = 4
+        send_telegram("""<b>Step 4/6</b> — Estimated % of peak unrealized gains captured?
+
+Reply with a number like <b>100</b>, <b>75</b>, <b>50</b>, <b>25</b>, or <b>0</b>""")
+
+    elif step == 4:
+        try:
+            data["captured_pct"] = int(t.replace("%","").strip())
+        except:
+            data["captured_pct"] = 50
+        trade_log_state["step"] = 5
+        pattern_list = "\n".join([f"<b>{k}</b> — {v}" for k, v in BEHAVIOR_PATTERNS.items()])
+        send_telegram(f"""<b>Step 5/6</b> — Any behavioral patterns? (or <b>none</b>)
+
+{pattern_list}
+
+Reply with the keyword(s) separated by spaces e.g. <b>fear profit</b>""")
+
+    elif step == 5:
+        if t == "none":
+            data["patterns"] = []
+        else:
+            data["patterns"] = [p for p in t.split() if p in BEHAVIOR_PATTERNS]
+        trade_log_state["step"] = 6
+        send_telegram("""<b>Step 6/6</b> — One sentence: what's the lesson from this trade?
+
+Type anything, this is just for you.""")
+
+    elif step == 6:
+        data["lesson"] = text.strip()
+        trade_log_state["active"] = False
+        trade_log_state["step"] = 0
+
+        # Save to journal
+        j = load_journal()
+        entry = {
+            "result":       data.get("result", "scratch"),
+            "on_setup":     data.get("on_setup", False),
+            "followed_exit":data.get("followed_exit", "no"),
+            "captured_pct": data.get("captured_pct", 50),
+            "patterns":     data.get("patterns", []),
+            "lesson":       data.get("lesson", ""),
+            "time":         datetime.now(HST).isoformat(),
+        }
+        if not isinstance(j.get("trades"), list):
+            j["trades"] = []
+        j["trades"].append(entry)
+
+        # Update win/loss count (only count on-setup trades)
+        if data.get("on_setup"):
+            if data.get("result") == "win":
+                j["wins"] = j.get("wins", 0) + 1
+            elif data.get("result") == "loss":
+                j["losses"] = j.get("losses", 0) + 1
+        else:
+            j["off_plan"] = j.get("off_plan", 0) + 1
+
+        save_journal(j)
+
+        # Score summary
+        total_system = j.get("wins", 0) + j.get("losses", 0)
+        system_wr = (j["wins"] / total_system * 100) if total_system > 0 else 0
+        off_plan = j.get("off_plan", 0)
+
+        patterns_str = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS[p]}" for p in data.get("patterns", [])]) or "✅ No behavioral issues"
+        setup_str = "✅ ON SETUP — counts toward edge" if data.get("on_setup") else "⚪ OFF PLAN — not counted toward edge win rate"
+        captured = data.get("captured_pct", 50)
+        captured_emoji = "🔥" if captured >= 80 else "⚠️" if captured >= 50 else "❌"
+
+        send_telegram(f"""📋 <b>TRADE LOGGED</b>
+━━━━━━━━━━━━━━━━━━━━
+{setup_str}
+Result: <b>{data.get("result","scratch").upper()}</b>
+Exit plan followed: {data.get("followed_exit","?")}
+{captured_emoji} Gains captured: {captured}%
+
+<b>Behavior:</b>
+{patterns_str}
+
+<b>Lesson:</b>
+<i>{data.get("lesson","")}</i>
+━━━━━━━━━━━━━━━━━━━━
+📊 System trades: {j.get("wins",0)}W / {j.get("losses",0)}L ({system_wr:.1f}% WR)
+⚪ Off-plan trades: {off_plan}""")
+
+def show_patterns():
+    """Analyze behavioral patterns from journal."""
+    j = load_journal()
+    trades = [t for t in j.get("trades", []) if isinstance(t, dict) and "patterns" in t]
+    if not trades:
+        send_telegram("No trade data yet. Log trades with the <b>trade</b> command.")
+        return
+
+    # Count patterns
+    pattern_counts = {}
+    for t in trades:
+        for p in t.get("patterns", []):
+            pattern_counts[p] = pattern_counts.get(p, 0) + 1
+
+    # Avg captured pct
+    captured = [t.get("captured_pct", 100) for t in trades if "captured_pct" in t]
+    avg_captured = sum(captured) / len(captured) if captured else 100
+
+    # System vs off-plan
+    on_setup  = [t for t in trades if t.get("on_setup")]
+    off_plan  = [t for t in trades if not t.get("on_setup")]
+    on_wins   = sum(1 for t in on_setup  if t.get("result") == "win")
+    off_wins  = sum(1 for t in off_plan  if t.get("result") == "win")
+    on_wr     = (on_wins  / len(on_setup)  * 100) if on_setup  else 0
+    off_wr    = (off_wins / len(off_plan)  * 100) if off_plan  else 0
+
+    sorted_patterns = sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)
+    pattern_str = "\n".join([f"⚠️ {BEHAVIOR_PATTERNS.get(k,k)}: {v}x" for k,v in sorted_patterns]) or "✅ No recurring patterns yet"
+
+    send_telegram(f"""🧠 <b>BEHAVIORAL PATTERN REPORT</b>
+━━━━━━━━━━━━━━━━━━━━
+<b>SYSTEM (on-setup) trades:</b> {len(on_setup)}
+🎯 Win rate: {on_wr:.1f}%
+
+<b>OFF-PLAN (discretionary) trades:</b> {len(off_plan)}
+🎯 Win rate: {off_wr:.1f}%
+
+<b>Average gains captured:</b> {avg_captured:.0f}%
+
+<b>Recurring behaviors:</b>
+{pattern_str}
+━━━━━━━━━━━━━━━━━━━━
+<i>Your edge shows in system trades.
+Off-plan trades are where the account bleeds.</i>""")
+
+
 def handle_command(text: str):
+    # If trade log is active, process it
+    if trade_log_state.get("active"):
+        process_trade_log(text)
+        return
+
     # If setup check is active, process answers
     if check_state.get("active"):
         process_check_answer(text)
         return
 
     cmd = text.strip().lower()
+
+    if cmd == "trade":
+        trade_log_state["active"] = True
+        start_trade_log()
+        return
+
+    elif cmd == "patterns":
+        show_patterns()
+        return
 
     if cmd in ["brief", "morning", "gm"]:
         send_morning_brief()
@@ -574,13 +766,15 @@ VIX:  {fmt_macro(vix)}
 ━━━━━━━━━━━━━━━━━━━━
 <b>brief</b> — full pre-market brief
 <b>levels</b> — live SPY/QQQ/GLD/DXY/VIX
-<b>check</b> — setup quality scorer
-<b>win</b> — log a winning trade
-<b>loss</b> — log a losing trade
-<b>stats</b> — trade journal + progress
+<b>check</b> — setup quality scorer before entry
+<b>trade</b> — log trade with behavioral metrics
+<b>patterns</b> — see your behavioral pattern report
+<b>stats</b> — trade journal + progress to 100
 <b>report</b> — weekly edge report
 <b>status</b> — confirm Jarvis is online
-━━━━━━━━━━━━━━━━━━━━""")
+━━━━━━━━━━━━━━━━━━━━
+<i>win/loss still work for quick logging.
+Use trade for full behavioral breakdown.</i>""")
 
 # ── ALERT FORMATTER ───────────────────────────────────────────────────────────
 def format_alert(data: dict) -> str:
